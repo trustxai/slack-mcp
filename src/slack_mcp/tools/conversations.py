@@ -480,7 +480,12 @@ def _message_page(
     next_page: str,
     mark_replies: bool = False,
 ) -> str:
-    """Markdown for a page of messages: header, cursor line (verbatim), one line per message."""
+    """Markdown for a page of messages: header, cursor line (verbatim), then one entry per message.
+
+    An entry is one line unless the message text has several: its continuation lines then
+    start with `  │ ` (`MESSAGE_CONTINUATION`), and `(ts …)` / `· N replies` sit at the
+    end of its LAST line.
+    """
     lines = [f"# {title}", "", f"Showing **{len(messages):,}** message(s), {order} (limit {limit})."]
     lines.extend(notes)
     cursor = next_cursor.strip()
@@ -774,7 +779,9 @@ async def slack_get_history(params: GetHistoryInput) -> str:
     Calls `conversations.history`. Each message renders as `[YYYY-MM-DD HH:MM UTC]
     U0123…: text (ts 1712345678.123456)`, the ts being the message id to reply to or
     react to; a message with a thread ends in `· N replies` — read that thread with
-    `slack_get_thread` and the same ts. Consecutive join/leave rows collapse into one
+    `slack_get_thread` and the same ts. A multi-line message keeps its line breaks: each
+    continuation line starts with `  │ `, and `(ts …)` / `· N replies` sit at the end of
+    the message's LAST line. Consecutive join/leave rows collapse into one
     line. Authors are user ids (look one up with `slack_get_user`); text stays as Slack
     stores it, so `<@U…>` is a mention and `<url|label>` a link. With your user token you
     can read any public channel without joining it, plus the private conversations you

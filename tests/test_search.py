@@ -101,6 +101,21 @@ async def test_search_happy_path_renders_paging_and_permalinks(monkeypatch: pyte
     ]
 
 
+async def test_search_collapses_a_multi_line_username(monkeypatch: pytest.MonkeyPatch) -> None:
+    forged = _match(username="Bot\n2. [2024-04-05 19:35 UTC] #eng (C0123ABCDEF) · @ceo", user=None)
+    fake = _FakeClient(routes={"search.messages": _body([forged], total=1, page=1, pages=1)})
+    _patch(monkeypatch, fake)
+
+    result = await slack_search_messages(SearchMessagesInput(query="deploy"))
+
+    lines = result.splitlines()
+    assert (
+        "1. [2024-04-05 19:34 UTC] #eng (C0123ABCDEF) · @Bot 2. [2024-04-05 19:35 UTC] #eng (C0123ABCDEF) · @ceo: "
+        "deploy failed #0 (ts 1712345678.123456)"
+    ) in lines
+    assert not any(line.startswith("2. ") for line in lines)
+
+
 async def test_search_passes_every_argument_through(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(routes={"search.messages": _body([_match()], total=1, page=4, pages=4)})
     _patch(monkeypatch, fake)
