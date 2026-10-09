@@ -1,0 +1,97 @@
+[project]
+name = "amazing-slack-mcp"
+version = "0.1.0"
+description = "MCP server for the Slack Web API that speaks as YOU (user token, stdio only, writes gated by allowlists)."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Alejandro Latorre" }]
+keywords = [
+    "python",
+    "slack",
+    "messaging",
+    "mcp",
+    "llm-tools",
+    "model-context-protocol",
+    "mcp-server",
+]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Communications :: Chat",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.13"
+dependencies = [
+    # Capped below 2.0: the SDK's 2.x line drops `mcp.server.fastmcp` (FastMCP became
+    # `mcp.server.mcpserver.MCPServer`) and moves `mcp.types` out to the separate
+    # `mcp-types` package, so an unbounded spec makes `uvx amazing-slack-mcp` resolve
+    # to 2.x and die with ModuleNotFoundError on import.
+    "mcp>=1.1.0,<2",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "python-dotenv>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/trustxai/slack-mcp"
+Repository = "https://github.com/trustxai/slack-mcp"
+Issues = "https://github.com/trustxai/slack-mcp/issues"
+Changelog = "https://github.com/trustxai/slack-mcp/blob/main/CHANGELOG.md"
+
+[project.scripts]
+# Dist + script are both `amazing-slack-mcp` (ADR-0001: `slack-mcp` and `slack-mcp-server`
+# are taken on PyPI) so `uvx amazing-slack-mcp` resolves with no --from. stdio only: the
+# token acts as the user and never leaves the machine, so there is no http entry point.
+amazing-slack-mcp = "slack_mcp.server:main_stdio"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slack_mcp"]
+
+[dependency-groups]
+dev = [
+    # mcp[cli] provides the `mcp` dev CLI (mcp dev / inspector); the runtime
+    # server needs only core `mcp`, so the CLI extra lives here.
+    "mcp[cli]>=1.1.0,<2",
+    "pre-commit>=4.0",
+    "ruff>=0.11",
+    "mypy>=1.14",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "live: integration tests against the real Slack workspace (requires SLACK_USER_TOKEN in .env; read-only)",
+    "live_write: mutating integration tests (post/update/react in YOUR OWN self-DM only) — run ONLY as `SLACK_TEST_ALLOW_WRITES=1 uv run pytest -m live_write` (exported inline, never in .env)",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-third-party = ["mcp", "pydantic", "httpx"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["slack_mcp.*"]
+disallow_untyped_defs = true

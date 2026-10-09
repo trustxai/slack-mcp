@@ -1,0 +1,92 @@
+{
+  "company": "trustai",
+  "board": {
+    "backend": "repo",
+    "tasks_file": ".memory/tasks.yaml",
+    "memory_dir": ".memory"
+  },
+  "gates": {
+    "default": "uv run pytest -m \"not live and not live_write\" && uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv run mypy src/",
+    "live_smoke": "uv run pytest -m live",
+    "readme_table": "uv run python scripts/gen_tool_table.py --check"
+  },
+  "routing": {
+    "critical": "claude-fable-5-1",
+    "feature": "claude-opus-5-5",
+    "mechanical": "claude-opus-5-5",
+    "reduction": "claude-haiku-4-5"
+  },
+  "effort": {
+    "critical": "xhigh",
+    "feature": "xhigh",
+    "mechanical": "medium",
+    "reduction": "low"
+  },
+  "max_parallel": 5,
+  "merge_policy": "human",
+  "review": {
+    "default": "code-review",
+    "flagged_paths": {
+      "src/slack_mcp/client.py": "ultra+security-review",
+      "src/slack_mcp/config.py": "ultra+security-review",
+      "src/slack_mcp/guard.py": "ultra+security-review",
+      "src/slack_mcp/tools/chat.py": "ultra+security-review",
+      "src/slack_mcp/tools/conversations.py": "ultra+security-review",
+      ".github/workflows/*": "ultra+security-review"
+    }
+  },
+  "creds": {
+    "db": "staging-or-local-only"
+  },
+  "caps": {
+    "loop_iterations": 8,
+    "target_max_turns": 25
+  },
+  "interactive_only": [
+    "auth spike",
+    "schema review",
+    "architecture / strangler design",
+    "cutover",
+    "product decision",
+    "Slack app creation / scopes / install (one app per workspace: uDocz, Masava)",
+    "user token (xoxp) creation / rotation — never pasted into a session",
+    "PyPI / OIDC trusted-publishing setup",
+    "GitHub repo creation + branch protection",
+    "release cut",
+    "live smoke against the real workspaces (writes only in the user's own self-DM)",
+    "alejlatorre-mcps swap of slack-udocz + slack-masava + hot deploy with live sessions",
+    "first real send as the user (group DM with a teammate) — explicit OK per message"
+  ],
+  "reversibility_triggers": [
+    {
+      "decision": "publish to PyPI as `amazing-slack-mcp` (ADR-0001; `slack-mcp` and `slack-mcp-server` are taken)",
+      "trigger": "the user registers the pending trusted publisher under a different free name",
+      "fallback": "rename dist + console script in lockstep on main before the first release; import package `slack_mcp` and tool prefix `slack_` never change"
+    },
+    {
+      "decision": "ONE identity: a user token (xoxp) from the personal internal app 'Alejandro AI'; the server refuses xoxb/xapp/xoxc/xoxd at settings load. Bots are Hermes' gateway, not this MCP",
+      "trigger": "a workflow needs a bot identity from THIS server (Hermes cannot cover it)",
+      "fallback": "accept xoxb behind an explicit SLACK_ALLOW_BOT_TOKEN=1 with the user-only tools (search) failing cleanly; the guard semantics stay"
+    },
+    {
+      "decision": "stdio only — no http transport, no ax42 unit, no Funnel path: the token acts as the user and never leaves the machine",
+      "trigger": "a cloud client (Grok Bot) wants Slack",
+      "fallback": "NOT this token. A separate bot-token deployment (Data Bot) behind a bearer, as splitwise does; the user token stays local"
+    },
+    {
+      "decision": "raw httpx client against https://slack.com/api (JSON bodies where Slack accepts them, form-encoded where it does not — table in research/02), no `slack_sdk` dependency",
+      "trigger": "a method needs a quirk that costs more than a day to reproduce",
+      "fallback": "vendor the exact helper from python-slack-sdk (MIT) with attribution; still no SDK dependency"
+    },
+    {
+      "decision": "write guard = SLACK_ALLOW_WRITES=1 AND (channel in SLACK_WRITE_CHANNELS, or an IM/MPIM whose OTHER members are all in SLACK_WRITE_USERS); Slack Connect (is_ext_shared/is_shared/is_org_shared/is_pending_ext_shared) refused unless listed by ID; a post is never auto-retried",
+      "trigger": "the allowlists cost more friction than they buy for a trusted workspace",
+      "fallback": "a `*` wildcard for SLACK_WRITE_CHANNELS / SLACK_WRITE_USERS that still refuses Slack Connect channels; the switch stays in the package"
+    },
+    {
+      "decision": "name → user-ID resolution uses stdlib difflib over a users.list cache, no rapidfuzz dependency",
+      "trigger": "a live resolve mis-ranks a real teammate or exceeds 200 ms on the real user list",
+      "fallback": "add `rapidfuzz` as a runtime dependency and swap the scorer in tools/users.py only"
+    }
+  ]
+}
