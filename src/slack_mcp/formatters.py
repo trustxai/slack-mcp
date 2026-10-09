@@ -19,6 +19,9 @@ from slack_mcp.errors import hint_for, redact_credentials
 # Context-window guard: MCP responses cap at 1 MB; stay well under it.
 MAX_RESPONSE_BYTES = 900_000
 
+# Prefix for the 2nd+ lines of a multi-line message in `render_message`.
+MESSAGE_CONTINUATION = "  │ "
+
 # conversations.info flags that mean "people outside this workspace can read it".
 SHARED_FLAGS: tuple[str, ...] = ("is_ext_shared", "is_shared", "is_org_shared", "is_pending_ext_shared")
 
@@ -123,13 +126,18 @@ def render_message(message: Mapping[str, Any], *, names: Mapping[str, str] | Non
 
     `names` maps user ids to display strings; unknown authors keep their id (or
     `username`/`bot_id` for app posts). Text is passed through as Slack stores it, so
-    `<@U…>` mentions and `<url|label>` links stay recognisable.
+    `<@U…>` mentions and `<url|label>` links stay recognisable — except line breaks: every
+    line after the first is prefixed with `MESSAGE_CONTINUATION` (`  │ `), so a multi-line
+    message can never print a line that reads like another `[time] Name:` message. The
+    `(ts …)` and reply-count suffixes go on the LAST line.
     """
     author = str(message.get("user") or message.get("username") or message.get("bot_id") or "unknown")
     if names and author in names:
         author = names[author]
     ts = message.get("ts", "")
-    text = str(message.get("text") or "").strip()
+    first, *rest = str(message.get("text") or "").strip().splitlines() or [""]
+    continuation = "\n".join(f"{MESSAGE_CONTINUATION}{part}".rstrip() for part in rest)
+    text = f"{first}\n{continuation}" if rest else first
     subtype = message.get("subtype")
     line = f"[{ts_to_human(ts)}] {author}: {text}" if text else f"[{ts_to_human(ts)}] {author}"
     if subtype:
