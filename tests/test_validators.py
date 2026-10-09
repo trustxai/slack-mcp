@@ -18,6 +18,11 @@ from slack_mcp.validators import (
 
 # 2026-10-09T15:00:00Z
 EPOCH = int(datetime(2026, 10, 9, 15, 0, tzinfo=UTC).timestamp())
+EPOCH_MS = EPOCH * 1000  # 13 digits
+# Arabic-Indic and fullwidth digits: `\d` matches them and `int()` reads them.
+ARABIC_TS = "١٧١٢٣٤٥٦٧٨.١٢٣٤٥٦"
+ARABIC_EPOCH = "١٧١٢٣٤٥٦٧٨"
+FULLWIDTH_EPOCH = "１７１２３４５６７８"
 
 
 @pytest.mark.parametrize(
@@ -44,6 +49,29 @@ def test_is_conversation_id() -> None:
     assert is_conversation_id(None) is False
 
 
+@pytest.mark.parametrize("value", ["C0123ABCDEF\n", "C0123ABCDEF\r\n", "C0123ABCDEF\nU0456GHIJKL", "C0123ABCDEF "])
+def test_is_conversation_id_rejects_a_trailing_newline(value: str) -> None:
+    # `$` matched before a final "\n", so the guard's unstripped ID-only check passed it.
+    assert is_conversation_id(value) is False
+
+
+def test_channel_user_and_ts_still_strip_outer_whitespace_including_newlines() -> None:
+    assert channel_id("C0123ABCDEF\n") == "C0123ABCDEF"
+    assert user_id("\tU0123ABCDEF\n") == "U0123ABCDEF"
+    assert message_ts("1712345678.123456\n") == "1712345678.123456"
+
+
+@pytest.mark.parametrize("value", ["C0123ABCDEF\nC0456GHIJKL", "C0123AB\nCDEF"])
+def test_channel_id_rejects_an_inner_newline(value: str) -> None:
+    with pytest.raises(ValueError, match="Slack conversation ID"):
+        channel_id(value)
+
+
+def test_user_id_rejects_an_inner_newline() -> None:
+    with pytest.raises(ValueError, match="Slack user ID"):
+        user_id("U0123ABCDEF\nU0456GHIJKL")
+
+
 @pytest.mark.parametrize(("value", "expected"), [("U0123ABCDEF", "U0123ABCDEF"), (" W0456GHIJKL ", "W0456GHIJKL")])
 def test_user_id_accepts_user_ids(value: str, expected: str) -> None:
     assert user_id(value) == expected
@@ -63,7 +91,19 @@ def test_message_ts_accepts_slack_timestamps(value: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "value", ["1712345678", "1712345678.12345", "1712345678.1234567", "abc", "", "1712345678,123456"]
+    "value",
+    [
+        "1712345678",
+        "1712345678.12345",
+        "1712345678.1234567",
+        "abc",
+        "",
+        "1712345678,123456",
+        ARABIC_TS,
+        "１７１２３４５６７８.１２３４５６",  # fullwidth
+        "1712345678.123456\n1712345678.654321",
+        "1712345678123.123456",  # millisecond integer part
+    ],
 )
 def test_message_ts_rejects_other_shapes(value: str) -> None:
     with pytest.raises(ValueError, match="timestamp like 1712345678.123456"):
@@ -130,3 +170,53 @@ def test_time_to_ts_converts_iso_and_epoch(value: object, expected: str) -> None
 def test_time_to_ts_rejects_garbage_naming_the_field() -> None:
     with pytest.raises(ValueError, match="latest must be ISO-8601"):
         time_to_ts("last week", field="latest")
+
+
+# --- ASCII digits only, seconds not milliseconds -------------------------------------------
+
+
+@pytest.mark.parametrize("value", [ARABIC_TS, ARABIC_EPOCH, FULLWIDTH_EPOCH])
+def test_iso_to_epoch_rejects_non_ascii_digits(value: str) -> None:
+    with pytest.raises(ValueError, match="post_at must be ISO-8601"):
+        iso_to_epoch(value)
+
+
+@pytest.mark.parametrize("value", [ARABIC_TS, ARABIC_EPOCH, FULLWIDTH_EPOCH])
+def test_time_to_ts_rejects_non_ascii_digits(value: str) -> None:
+    with pytest.raises(ValueError, match="oldest must be ISO-8601"):
+        time_to_ts(value)
+
+
+@pytest.mark.parametrize("value", [str(EPOCH), EPOCH, f" {EPOCH} ", "999999999", 999999999])
+def test_iso_to_epoch_reads_9_and_10_digit_epochs_as_seconds(value: object) -> None:
+    assert iso_to_epoch(value) == int(str(value).strip())
+
+
+@pytest.mark.parametrize("value", [str(EPOCH_MS), EPOCH_MS, f"{EPOCH_MS}.000000"])
+def test_iso_to_epoch_rejects_a_millisecond_epoch_naming_milliseconds(value: object) -> None:
+    with pytest.raises(ValueError, match="post_at must be epoch SECONDS") as info:
+        iso_to_epoch(value)
+    assert "milliseconds" in str(info.value)
+    assert "divide by 1000" in str(info.value)
+
+
+@pytest.mark.parametrize("value", ["17123456781", "171234567812", "1712345678123456", 17123456781])
+def test_iso_to_epoch_rejects_other_over_long_epochs(value: object) -> None:
+    with pytest.raises(ValueError, match="post_at must be epoch SECONDS"):
+        iso_to_epoch(value)
+
+
+def test_iso_to_epoch_keeps_small_ints() -> None:
+    assert iso_to_epoch(0) == 0
+
+
+@pytest.mark.parametrize("value", [str(EPOCH), EPOCH])
+def test_time_to_ts_reads_a_10_digit_epoch_as_seconds(value: object) -> None:
+    assert time_to_ts(value) == f"{EPOCH}.000000"
+
+
+@pytest.mark.parametrize("value", [str(EPOCH_MS), EPOCH_MS, f"{EPOCH_MS}.000000"])
+def test_time_to_ts_rejects_a_millisecond_epoch_naming_milliseconds(value: object) -> None:
+    with pytest.raises(ValueError, match="latest must be epoch SECONDS") as info:
+        time_to_ts(value, field="latest")
+    assert "milliseconds" in str(info.value)

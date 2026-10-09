@@ -135,7 +135,9 @@ async def test_open_without_users_or_by_channel_is_refused() -> None:
 # --- row 3: IDs only ------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("channel", ["#general", "general", "U0ANA000001", "c0123abcdef", " C0123ABCDEF"])
+@pytest.mark.parametrize(
+    "channel", ["#general", "general", "U0ANA000001", "c0123abcdef", " C0123ABCDEF", "C0123ABCDEF\n"]
+)
 async def test_a_channel_that_is_not_a_conversation_id_is_refused(channel: str) -> None:
     fetch = _FakeFetch()
     guard = _guard(fetch, slack_write_channels="#general,general,C0123ABCDEF", slack_write_users=ANA)
