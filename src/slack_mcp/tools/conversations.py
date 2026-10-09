@@ -98,8 +98,9 @@ def _limit_field(what: str) -> Any:
         ge=1,
         le=MAX_PAGE_LIMIT,
         description=(
-            f"How many {what} to ask Slack for in this page (1–{MAX_PAGE_LIMIT}, default {DEFAULT_LIMIT}). "
-            f"Markdown shows at most {MAX_DISPLAY_ROWS} of them; JSON shows all."
+            f"How many {what} per page (1–{MAX_PAGE_LIMIT}, default {DEFAULT_LIMIT}). Markdown pages hold at "
+            f"most {MAX_DISPLAY_ROWS}, so markdown asks Slack for at most {MAX_DISPLAY_ROWS} and the cursor never "
+            "skips a row; JSON sends the full limit."
         ),
     )
 
@@ -292,9 +293,9 @@ class OpenConversationInput(BaseModel):
         min_length=1,
         max_length=MAX_OPEN_USERS,
         description=(
-            f"1–{MAX_OPEN_USERS} Slack user ids (U…/W…) of the OTHER people — Slack adds you automatically. One id "
-            "opens a DM with that person; 2 or more open a group DM of you + them (at most 9 people). Resolve names "
-            "with slack_resolve_user first."
+            f"1–{MAX_OPEN_USERS} Slack user ids (U…/W…) of the OTHER people — Slack adds you automatically, so do "
+            "not include your own id, except alone (that opens your self-DM). One id opens a DM with that person; "
+            "2 or more open a group DM of you + them (at most 9 people). Resolve names with slack_resolve_user first."
         ),
     )
 
@@ -332,10 +333,28 @@ def _next_cursor(body: Mapping[str, Any]) -> str:
 
 
 def _text_of(field: Any) -> str:
-    """`topic` / `purpose` objects carry the text under `value`."""
+    """The text under `value` of a `topic` / `purpose` object, on ONE line.
+
+    Anyone in the channel can set these, so newlines are collapsed: a purpose such as
+    "x\\n- **Slack Connect: no**" must not print a second, fake bullet.
+    """
     if isinstance(field, Mapping):
-        return str(field.get("value") or "").strip()
+        return " ".join(str(field.get("value") or "").split())
     return ""
+
+
+def _page_limit(limit: int, fmt: ResponseFormat) -> int:
+    """The `limit` sent to Slack: markdown never asks for more rows than it can show."""
+    return limit if fmt is ResponseFormat.JSON else min(limit, MAX_DISPLAY_ROWS)
+
+
+def _reduced_limit_note(requested: int, sent: int) -> str | None:
+    if sent >= requested:
+        return None
+    return (
+        f"Markdown pages hold at most {MAX_DISPLAY_ROWS} rows, so Slack was asked for {sent} (not {requested}) and the "
+        f"cursor continues right after them; use response_format=json for pages up to {MAX_PAGE_LIMIT}."
+    )
 
 
 def _mpim_handles(name: Any) -> list[str]:
@@ -402,9 +421,10 @@ def _conversation_row(conv: Mapping[str, Any]) -> str:
 
 
 def _cap_note(hidden: int, what: str) -> str:
+    # Only reachable when Slack returns more rows than the (already capped) limit asked for.
     return (
-        f"_{hidden} more {what} on this page not shown (markdown cap {MAX_DISPLAY_ROWS}) — use "
-        f"response_format=json, or a limit ≤ {MAX_DISPLAY_ROWS}; the cursor resumes AFTER this whole page._"
+        f"_{hidden} more {what} on this page not shown (markdown cap {MAX_DISPLAY_ROWS}; Slack returned more than "
+        "the limit) — use response_format=json; the cursor resumes AFTER this whole page._"
     )
 
 
@@ -509,8 +529,8 @@ async def slack_list_conversations(params: ListConversationsInput) -> str:
 
     Returns:
     A markdown table (Conversation | ID | Type | Members | You're in | Shared | Topic),
-    at most 50 rows, or with `response_format="json"` the raw Slack objects plus
-    `next_cursor`. A DM row shows `Shared: unknown (DM)`: Slack's list omits the external
+    at most 50 rows (markdown asks Slack for at most 50), or with `response_format="json"`
+    the raw Slack objects (up to `limit`) plus `next_cursor`. A DM row shows `Shared: unknown (DM)`: Slack's list omits the external
     flags on DMs.
 
     Pagination:
@@ -531,10 +551,11 @@ async def slack_list_conversations(params: ListConversationsInput) -> str:
     or `limit` are rejected locally before anything is sent.
     """
     try:
+        limit = _page_limit(params.limit, params.response_format)
         request: dict[str, Any] = {
             "types": list(params.types),
             "exclude_archived": params.exclude_archived,
-            "limit": params.limit,
+            "limit": limit,
         }
         if params.cursor is not None:
             request["cursor"] = params.cursor
@@ -553,9 +574,12 @@ async def slack_list_conversations(params: ListConversationsInput) -> str:
                 item_formatter=_conversation_row,
                 title="Slack conversations",
                 next_cursor=next_cursor,
-                limit=params.limit,
+                limit=limit,
                 note=notes[0],
             )
+        reduced = _reduced_limit_note(params.limit, limit)
+        if reduced:
+            notes.append(reduced)
         shown = conversations[:MAX_DISPLAY_ROWS]
         if len(conversations) > len(shown):
             notes.append(_cap_note(len(conversations) - len(shown), "conversation(s)"))
@@ -565,7 +589,7 @@ async def slack_list_conversations(params: ListConversationsInput) -> str:
             item_formatter=_conversation_row,
             title="Slack conversations",
             next_cursor=next_cursor,
-            limit=params.limit,
+            limit=limit,
             note="\n".join(notes),
             table_header=["Conversation", "ID", "Type", "Members", "You're in", "Shared", "Topic"],
         )
@@ -597,8 +621,9 @@ async def slack_get_conversation(params: GetConversationInput) -> str:
     - To read messages (use `slack_get_history`).
 
     Returns:
-    A markdown block with the conversation's fields and the `Slack Connect: yes/no` line,
-    or with `response_format="json"` the raw Slack `channel` object.
+    A markdown block with the conversation's fields and the `Slack Connect: yes/no` line
+    (topic and purpose on one line each), or with `response_format="json"` the raw Slack
+    `channel` object. If Slack's answer has no `channel` object, says so and nothing else.
 
     Examples:
     - `params = {"channel": "C0123ABCDEF"}`
@@ -613,7 +638,10 @@ async def slack_get_conversation(params: GetConversationInput) -> str:
     try:
         body = await get_client().call("conversations.info", {"channel": params.channel, "include_num_members": True})
         raw = body.get("channel")
-        conv: dict[str, Any] = raw if isinstance(raw, dict) else {}
+        if not isinstance(raw, dict) or not raw:
+            # Never render type / "Slack Connect: no" from an empty object.
+            return clip_response(f"Slack returned no channel object for {params.channel}.")
+        conv: dict[str, Any] = raw
         if params.response_format is ResponseFormat.JSON:
             return clip_response(to_json(conv))
         cid = conv.get("id") or params.channel
@@ -630,8 +658,15 @@ async def slack_get_conversation(params: GetConversationInput) -> str:
                 "- **Slack Connect: no** (no sharing flag set — Slack may omit them on DMs, so the write guard checks "
                 "a DM's members against SLACK_WRITE_USERS instead)"
             )
+        elif kind == "mpim":
+            lines.append(
+                "- **Slack Connect: no** (no sharing flag set) — the write guard checks a group DM's members against "
+                "SLACK_WRITE_USERS"
+            )
         else:
-            lines.append("- **Slack Connect: no** (internal to this workspace)")
+            lines.append(
+                f"- **Slack Connect: no** (no sharing flag set) — writes need its id ({cid}) in SLACK_WRITE_CHANNELS"
+            )
         if conv.get("is_frozen"):
             lines.append("- **frozen**: yes — a disconnected Slack Connect copy, read-only")
         team_ids = conv.get("shared_team_ids")
@@ -680,8 +715,8 @@ async def slack_list_members(params: ListMembersInput) -> str:
     - For the member COUNT only (use `slack_get_conversation`, which shows it).
 
     Returns:
-    A markdown list of user ids (at most 50 per page), or with `response_format="json"`
-    the raw id list plus `next_cursor`.
+    A markdown list of user ids (markdown asks Slack for at most 50 per page), or with
+    `response_format="json"` the raw id list (up to `limit`) plus `next_cursor`.
 
     Pagination:
     Cursor-based: when more exist the output prints `next_cursor` verbatim — pass it back
@@ -698,7 +733,8 @@ async def slack_list_members(params: ListMembersInput) -> str:
     `mpim:read` or `im:read`). A non-id `channel` is rejected locally.
     """
     try:
-        request: dict[str, Any] = {"channel": params.channel, "limit": params.limit}
+        limit = _page_limit(params.limit, params.response_format)
+        request: dict[str, Any] = {"channel": params.channel, "limit": limit}
         if params.cursor is not None:
             request["cursor"] = params.cursor
         body = await get_client().call("conversations.members", request)
@@ -709,6 +745,9 @@ async def slack_list_members(params: ListMembersInput) -> str:
         if params.response_format is ResponseFormat.JSON:
             items = members
         else:
+            reduced = _reduced_limit_note(params.limit, limit)
+            if reduced:
+                note += "\n" + reduced
             items = members[:MAX_DISPLAY_ROWS]
             if len(members) > len(items):
                 note += "\n" + _cap_note(len(members) - len(items), "member id(s)")
@@ -718,7 +757,7 @@ async def slack_list_members(params: ListMembersInput) -> str:
             item_formatter=lambda uid: f"- {md_cell(uid)}",
             title=f"Members of {params.channel}",
             next_cursor=next_cursor,
-            limit=params.limit,
+            limit=limit,
             note=note,
         )
     except Exception as exc:
@@ -751,9 +790,9 @@ async def slack_get_history(params: GetHistoryInput) -> str:
     - When you only have a channel NAME (resolve it with `slack_list_conversations` first).
 
     Returns:
-    A markdown transcript (at most 50 messages of the page, the newest of them, shown
-    oldest first), or with `response_format="json"` the raw Slack messages in Slack's own
-    order (newest first) plus `next_cursor`.
+    A markdown transcript shown oldest first (markdown asks Slack for at most 50 messages
+    per page), or with `response_format="json"` the raw Slack messages (up to `limit`) in
+    Slack's own order (newest first) plus `next_cursor`.
 
     Pagination:
     Slack returns the newest messages first; `next_cursor` (printed verbatim when more
@@ -772,7 +811,8 @@ async def slack_get_history(params: GetHistoryInput) -> str:
     bounds, or `oldest` after `latest`, are rejected locally.
     """
     try:
-        request: dict[str, Any] = {"channel": params.channel, "limit": params.limit}
+        limit = _page_limit(params.limit, params.response_format)
+        request: dict[str, Any] = {"channel": params.channel, "limit": limit}
         if params.oldest is not None:
             request["oldest"] = params.oldest
         if params.latest is not None:
@@ -792,19 +832,23 @@ async def slack_get_history(params: GetHistoryInput) -> str:
                 item_formatter=render_message,
                 title=title,
                 next_cursor=next_cursor,
-                limit=params.limit,
+                limit=limit,
                 note="Messages in Slack's order: newest first.",
             )
         # Slack sends newest first: keep the newest page rows, then read them chronologically.
         shown = list(reversed(messages[:MAX_DISPLAY_ROWS]))
+        notes = ["Messages ending in `· N replies` have a thread: read it with slack_get_thread and that ts."]
+        reduced = _reduced_limit_note(params.limit, limit)
+        if reduced:
+            notes.append(reduced)
         return _message_page(
             title=title,
             messages=shown,
             total=len(messages),
             order="oldest first",
-            notes=["Messages ending in `· N replies` have a thread: read it with slack_get_thread and that ts."],
+            notes=notes,
             next_cursor=next_cursor,
-            limit=params.limit,
+            limit=limit,
             next_page="older messages",
         )
     except Exception as exc:
@@ -831,11 +875,12 @@ async def slack_get_thread(params: GetThreadInput) -> str:
     - To read a whole channel (use `slack_get_history`).
     - To find a thread by words (use `slack_search_messages`).
     - To reply (use `slack_reply_in_thread` with the parent ts).
+    - When you only have a channel NAME (resolve it with `slack_list_conversations` first).
 
     Returns:
-    A markdown transcript (at most 50 messages of the page), or with
-    `response_format="json"` the raw Slack messages plus `next_cursor`. A message with no
-    replies comes back alone.
+    A markdown transcript (markdown asks Slack for at most 50 messages per page), or with
+    `response_format="json"` the raw Slack messages (up to `limit`) plus `next_cursor`. A
+    message with no replies comes back alone.
 
     Pagination:
     Long threads page with `next_cursor` (printed verbatim when more exist): pass it back
@@ -852,7 +897,8 @@ async def slack_get_thread(params: GetThreadInput) -> str:
     `mpim:history` or `im:history`). A malformed `thread_ts` is rejected locally.
     """
     try:
-        request: dict[str, Any] = {"channel": params.channel, "ts": params.thread_ts, "limit": params.limit}
+        limit = _page_limit(params.limit, params.response_format)
+        request: dict[str, Any] = {"channel": params.channel, "ts": params.thread_ts, "limit": limit}
         if params.cursor is not None:
             request["cursor"] = params.cursor
         body = await get_client().call("conversations.replies", request)
@@ -866,7 +912,7 @@ async def slack_get_thread(params: GetThreadInput) -> str:
                 item_formatter=render_message,
                 title=title,
                 next_cursor=next_cursor,
-                limit=params.limit,
+                limit=limit,
                 note="Messages in Slack's order: parent first, then replies oldest first.",
             )
         # Parent first (stable): Slack already sends it first; this only guarantees it.
@@ -878,6 +924,9 @@ async def slack_get_thread(params: GetThreadInput) -> str:
             notes.append(f"Parent first, replies marked ↳. To reply in this thread use thread_ts = {parent['ts']}.")
         else:
             notes.append("Replies marked ↳ (the parent message is not on this page).")
+        reduced = _reduced_limit_note(params.limit, limit)
+        if reduced:
+            notes.append(reduced)
         return _message_page(
             title=title,
             messages=shown,
@@ -885,7 +934,7 @@ async def slack_get_thread(params: GetThreadInput) -> str:
             order="parent first, then replies oldest first",
             notes=notes,
             next_cursor=next_cursor,
-            limit=params.limit,
+            limit=limit,
             next_page="later replies",
             mark_replies=True,
         )
@@ -908,10 +957,12 @@ async def slack_open_conversation(params: OpenConversationInput) -> str:
 
     This is how to start a DM or a group DM. Calls `conversations.open` with the user ids
     (and `return_im`); Slack adds YOU automatically, so one id gives a DM with that
-    person and 2–8 ids give a group DM of you + them (at most 9 people). If that
-    conversation already exists Slack returns it (`already_open`) instead of making a new
-    one. Opening sends no message: the next step is `slack_post_message` to the returned
-    `D…` / `G…` id — never post to a `U…` user id directly.
+    person and 2–8 ids give a group DM of you + them (at most 9 people). Do not include
+    your own id, except alone: `users = [<your id>]` opens your self-DM (your id is in
+    `slack_health_check`). If that conversation already exists Slack returns it
+    (`already_open`) instead of making a new one. Opening sends no message: the next step
+    is `slack_post_message` to the returned `D…` / `G…` id — never post to a `U…` user id
+    directly.
 
     Refused unless `SLACK_ALLOW_WRITES=1` AND the target is allowed by
     `SLACK_WRITE_CHANNELS` / `SLACK_WRITE_USERS` (Slack Connect channels only by explicit
@@ -957,9 +1008,8 @@ async def slack_open_conversation(params: OpenConversationInput) -> str:
         raw = body.get("channel")
         conv: dict[str, Any] = raw if isinstance(raw, dict) else {}
         cid = conv.get("id")
-        requested = (
-            f"a DM with {users[0]}" if len(users) == 1 else f"a group DM of you + {', '.join(users)}"
-        ) + f" ({len(users)} user id{'' if len(users) == 1 else 's'})"
+        # Neutral: the ids as sent. Whether that makes a DM, a group DM or your self-DM is Slack's answer.
+        requested = f"users {', '.join(users)}"
         if not cid:
             return clip_response(
                 f"Slack answered ok to conversations.open for {requested} but returned no conversation id — "
