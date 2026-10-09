@@ -1,7 +1,7 @@
 """Unit tests for the chat tools (post / reply / update / schedule) against a fake client.
 
 No live tests here on purpose: these tools write AS THE USER, and the live write smoke
-belongs to the conductor's t6 (self-DM only). Two end-to-end tests at the bottom run the
+belongs to the conductor's t6 (self-DM only). Three end-to-end tests at the bottom run the
 real `SlackClient` over `httpx.MockTransport` to prove the tools' writes go through the
 client's guard and on the wire as JSON.
 """
@@ -171,22 +171,50 @@ async def test_post_permalink_failure_still_reports_the_message_as_sent(monkeypa
     assert "SENT — Slack accepted the message (ok)" in result
     assert f"- **channel**: {CHANNEL}" in result
     assert f"- **ts**: {TS}" in result
-    assert "- **permalink**: lookup failed — Error (message_not_found)" in result
-    assert "The message itself WAS sent; do not post it again." in result
+    assert (
+        "- **permalink**: lookup failed (`message_not_found`) — No message with that ts exists in that conversation "
+        "(check channel AND ts). The message itself WAS sent; do not post it again."
+    ) in result
     assert "not sent" not in result.lower()
     # One post, one lookup — the post is never repeated.
     assert [method for method, _ in fake.calls] == ["chat.postMessage", "chat.getPermalink"]
 
 
-async def test_post_permalink_transport_failure_still_reports_sent(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = _FakeClient(routes={"chat.postMessage": _posted(), "chat.getPermalink": httpx.ConnectError("down")})
+_PERMALINK_REQUEST = httpx.Request("POST", "https://slack.com/api/chat.getPermalink")
+
+
+@pytest.mark.parametrize(
+    ("exc", "cause"),
+    [
+        (httpx.ReadTimeout("slow"), "(ReadTimeout)"),
+        (
+            httpx.HTTPStatusError(
+                "503", request=_PERMALINK_REQUEST, response=httpx.Response(503, request=_PERMALINK_REQUEST)
+            ),
+            "(HTTPStatusError 503)",
+        ),
+        (httpx.ConnectError("down"), "(ConnectError)"),
+        (SlackApiError("internal_error", method="chat.getPermalink"), "(`internal_error`)"),
+        (SlackApiError("non_json_response", method="chat.getPermalink"), "(`non_json_response`)"),
+    ],
+)
+async def test_post_permalink_timeout_or_5xx_says_sent_without_the_unknown_write_advice(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception, cause: str
+) -> None:
+    fake = _FakeClient(routes={"chat.postMessage": _posted(), "chat.getPermalink": exc})
     _patch(monkeypatch, fake)
 
     result = await slack_post_message(PostMessageInput(channel=CHANNEL, text="hello"))
 
     assert result.startswith("# Message sent")
-    assert "lookup failed — Error: could not connect" in result
-    assert "WAS sent" in result
+    assert f"- **permalink**: lookup failed {cause}. The message itself WAS sent; do not post it again." in result
+    # The write-outcome advice belongs to a failed POST, never under "SENT".
+    assert "UNKNOWN" not in result
+    assert "retrying" not in result
+    assert "may or may not" not in result
+    assert "Error:" not in result  # no handle_api_error text ("Error: …" / "Error (code): …")
+    assert "Error (" not in result
+    assert [method for method, _ in fake.calls] == ["chat.postMessage", "chat.getPermalink"]
 
 
 async def test_post_without_ts_in_the_answer_skips_the_permalink(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -370,7 +398,7 @@ async def test_reply_permalink_failure_still_reports_sent(monkeypatch: pytest.Mo
     result = await slack_reply_in_thread(ReplyInThreadInput(channel=CHANNEL, thread_ts=PARENT_TS, text="ok"))
 
     assert result.startswith("# Reply sent")
-    assert "lookup failed — Error (channel_not_found)" in result
+    assert "lookup failed (`channel_not_found`) — Wrong conversation id" in result
     assert "WAS sent" in result
 
 
@@ -395,6 +423,11 @@ async def test_reply_thread_not_found_is_rendered_with_its_hint(monkeypatch: pyt
             {"channel": CHANNEL, "thread_ts": PARENT_TS, "text": "x" * (MARKDOWN_TEXT_MAX + 1), "format": "markdown"},
             "Slack limits to 12,000 characters",
         ),
+        (
+            {"channel": CHANNEL, "thread_ts": PARENT_TS, "text": "x", "username": "bot"},
+            "Extra inputs are not permitted",
+        ),
+        ({"channel": CHANNEL, "thread_ts": PARENT_TS, "text": "x", "blocks": []}, "Extra inputs are not permitted"),
     ],
 )
 def test_reply_input_rejections(kwargs: dict[str, Any], message: str) -> None:
@@ -598,6 +631,16 @@ def test_schedule_window_edges_with_a_pinned_clock(monkeypatch: pytest.MonkeyPat
         ({"channel": CHANNEL, "post_at": True, "text": "x"}, "not a bool"),
         ({"channel": "#dev", "post_at": "2099-01-01", "text": "x"}, "channel must be a Slack conversation ID"),
         ({"channel": CHANNEL, "post_at": "2099-01-01", "text": "x", "metadata": {}}, "Extra inputs are not permitted"),
+        (
+            # A valid post_at, so the model-level 12,000 cap is what fails.
+            {
+                "channel": CHANNEL,
+                "post_at": int(time.time()) + 86_400,
+                "text": "x" * (MARKDOWN_TEXT_MAX + 1),
+                "format": "markdown",
+            },
+            "Slack limits to 12,000 characters",
+        ),
     ],
 )
 def test_schedule_input_rejections(kwargs: dict[str, Any], message: str) -> None:

@@ -20,11 +20,12 @@ from __future__ import annotations
 import time
 from typing import Any, Literal, Self
 
+import httpx
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from slack_mcp.client import SlackClient, get_client
-from slack_mcp.errors import handle_api_error
+from slack_mcp.errors import SlackApiError, handle_api_error, hint_for
 from slack_mcp.formatters import clip_response, fmt_warnings, ts_to_human
 from slack_mcp.server import mcp
 from slack_mcp.validators import channel_id, iso_to_epoch, message_ts
@@ -33,11 +34,19 @@ from slack_mcp.validators import channel_id, iso_to_epoch, message_ts
 MessageFormat = Literal["mrkdwn", "markdown"]
 
 # Research 02 §4.13–§4.15.
-POST_TEXT_MAX = 40_000  # chat.postMessage / scheduleMessage: Slack truncates beyond this
+# postMessage truncates past this; scheduleMessage reuses the cap — its msg_too_long
+# threshold is undocumented (02 O-2, measured in t6).
+POST_TEXT_MAX = 40_000
 MARKDOWN_TEXT_MAX = 12_000  # markdown_text: "Limit this field to 12,000 characters"
 UPDATE_TEXT_MAX = 4_000  # chat.update: msg_too_long past 4,000 characters
 SCHEDULE_MAX_DAYS = 120  # chat.scheduleMessage: "up to 120 days into the future"
 SCHEDULE_MAX_SECONDS = SCHEDULE_MAX_DAYS * 86_400
+
+# Slack codes whose errors.py hint is the "outcome UNKNOWN — read back before retrying"
+# wording for writes; a failed permalink lookup under "SENT" renders them by code only.
+_UNKNOWN_OUTCOME_CODES = frozenset(
+    {"request_timeout", "internal_error", "fatal_error", "service_unavailable", "non_json_response"}
+)
 
 _CHANNEL_DESCRIPTION = (
     "Conversation ID to post in: C… (channel), D… (DM) or G… (group DM / private channel). Never a #name or a "
@@ -253,6 +262,21 @@ class ScheduleMessageInput(BaseModel):
 # -- shared post path ------------------------------------------------------------
 
 
+def _lookup_failure(exc: Exception) -> str:
+    """Why chat.getPermalink failed, by cause only — `(code) — hint` or `(ExceptionType)`.
+
+    Deliberately NOT `handle_api_error`: its timeout / 5xx wording ("execution status is
+    UNKNOWN … before retrying") is about a write, and printed under "SENT" it could push
+    an LLM to post the message again.
+    """
+    if isinstance(exc, SlackApiError):
+        hint = "" if exc.code in _UNKNOWN_OUTCOME_CODES else hint_for(exc.code, exc.method)
+        return f"(`{exc.code}`)" + (f" — {hint.rstrip('.')}" if hint else "")
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"({type(exc).__name__} {exc.response.status_code})"
+    return f"({type(exc).__name__})"
+
+
 async def _permalink_line(client: SlackClient, channel: str, ts: str) -> str:
     """The permalink bullet. A lookup failure is reported here, never as a failed post."""
     if not channel or not ts:
@@ -261,8 +285,7 @@ async def _permalink_line(client: SlackClient, channel: str, ts: str) -> str:
         body = await client.call("chat.getPermalink", {"channel": channel, "message_ts": ts})
     except Exception as exc:
         return (
-            f"- **permalink**: lookup failed — {handle_api_error(exc)} The message itself WAS sent; do not post it "
-            "again."
+            f"- **permalink**: lookup failed {_lookup_failure(exc)}. The message itself WAS sent; do not post it again."
         )
     link = body.get("permalink")
     return f"- **permalink**: {link}" if link else "- **permalink**: Slack returned none"
