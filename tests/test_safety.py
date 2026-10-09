@@ -20,10 +20,11 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session
-from mcp.types import ErrorData, TextContent
+from mcp.types import TextContent
+from pydantic import AnyUrl
 
 from slack_mcp.config import get_settings
-from slack_mcp.errors import SlackApiError
+from slack_mcp.errors import SlackApiError, redact_credentials
 from slack_mcp.safety import (
     MAX_ERROR_MESSAGE_CHARS,
     RedactingFastMCP,
@@ -32,9 +33,18 @@ from slack_mcp.safety import (
 )
 from slack_mcp.server import mcp
 from slack_mcp.tools.conversations import GetHistoryInput, slack_get_history
+from slack_mcp.validators import channel_id
+
+try:  # URL elicitation is newer than the declared mcp floor; its pass-through test skips there
+    from mcp.shared.exceptions import UrlElicitationRequiredError
+    from mcp.types import ElicitRequestURLParams
+except ImportError:  # pragma: no cover - exercised only against the floor version
+    UrlElicitationRequiredError = None  # type: ignore[assignment,misc]
 
 FAKE_BOT = "xoxb-1234567890-abcdefghij"
 FAKE_USER = "xoxp-1234567890-abcdefghij"
+# Longer than pydantic's 50-character repr limit, so `input_value=` shows head...tail.
+FAKE_LONG = "xoxp-1234567890-1234567890-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"
 CHANNEL = "C0123ABCDEF"
 
 
@@ -168,6 +178,23 @@ async def test_a_huge_echoed_value_is_clipped_after_redaction() -> None:
     assert "xox" not in text
 
 
+async def test_a_token_straddling_the_cut_is_redacted_before_clipping() -> None:
+    """The token starts 12 characters before the cut: clip-then-redact would leak its head."""
+    with pytest.raises(ValueError) as probe:
+        channel_id("")
+    prefix = f"Value error, {str(probe.value)[:-1]}"  # pydantic's msg, up to and including "got '"
+    start = MAX_ERROR_MESSAGE_CHARS - 12
+    value = "a" * (start - len(prefix)) + FAKE_USER + " " + "y" * 100
+    naive = redact_credentials(f"{prefix}{value}'"[:MAX_ERROR_MESSAGE_CHARS])
+    assert naive.endswith(FAKE_USER[:12]), naive  # the wrong order really would leak `xoxp-1234567`
+
+    text = await _sdk_error("slack_get_history", {"params": {"channel": value}})
+
+    assert "a***" in text, text
+    assert "[truncated]" in text, text
+    assert "xox" not in text, text
+
+
 async def test_an_unknown_token_shaped_tool_name_is_redacted() -> None:
     text = await _sdk_error(FAKE_BOT, {})
 
@@ -183,6 +210,35 @@ async def test_over_the_protocol_the_client_gets_is_error_with_redacted_text() -
     assert isinstance(block, TextContent)
     _assert_scrubbed(block.text, FAKE_BOT)
     assert "got '***'" in block.text
+
+
+async def test_an_unknown_token_shaped_prompt_name_is_redacted() -> None:
+    with pytest.raises(ValueError) as plain:
+        await FastMCP.get_prompt(mcp, FAKE_USER)
+    with pytest.raises(type(plain.value)) as scrubbed:  # same type, so the SDK maps it as before
+        await mcp.get_prompt(FAKE_USER)
+    assert str(scrubbed.value) == "Unknown prompt: ***"
+
+    async with create_connected_server_and_client_session(mcp) as client:
+        with pytest.raises(McpError) as info:
+            await client.get_prompt(FAKE_USER, {})
+
+    assert info.value.error.message == "Unknown prompt: ***"
+
+
+async def test_an_unknown_token_shaped_resource_uri_is_redacted() -> None:
+    uri = f"https://example.com/{FAKE_USER}"
+    with pytest.raises(Exception) as plain:
+        await FastMCP.read_resource(mcp, uri)
+    with pytest.raises(type(plain.value)) as scrubbed:
+        await mcp.read_resource(uri)
+    assert str(scrubbed.value) == "Unknown resource: https://example.com/***"
+
+    async with create_connected_server_and_client_session(mcp) as client:
+        with pytest.raises(McpError) as info:
+            await client.read_resource(AnyUrl(uri))
+
+    assert info.value.error.message == "Unknown resource: https://example.com/***"
 
 
 # --- what the tools return is unchanged ------------------------------------------------------
@@ -231,9 +287,17 @@ def _scratch_server() -> RedactingFastMCP:
     async def boom() -> str:
         raise RuntimeError(f"tool body blew up holding {FAKE_USER}")
 
-    @server.tool(name="elicit")
-    async def elicit() -> str:
-        raise McpError(ErrorData(code=-32042, message="elicitation required"))
+    if UrlElicitationRequiredError is not None:
+
+        @server.tool(name="elicit")
+        async def elicit() -> str:
+            raise UrlElicitationRequiredError(
+                [
+                    ElicitRequestURLParams(
+                        mode="url", message="sign in", url="https://example.com/auth", elicitationId="e1"
+                    )
+                ]
+            )
 
     return server
 
@@ -247,14 +311,15 @@ async def test_an_exception_from_a_tool_body_is_redacted_too() -> None:
     assert info.value.__suppress_context__ is True
 
 
-async def test_an_mcp_error_is_not_rewrapped() -> None:
-    server = _scratch_server()
-    with pytest.raises(ToolError) as plain:
-        await FastMCP.call_tool(server, "elicit", {})
-    # Today the SDK wraps a tool body's McpError in a ToolError itself; whatever it does,
-    # the subclass must not change the exception type it lets through.
-    with pytest.raises(type(plain.value)):
-        await server.call_tool("elicit", {})
+async def test_a_url_elicitation_error_passes_through_untouched() -> None:
+    """The SDK's Tool.run re-raises this McpError unwrapped; the subclass must too."""
+    if UrlElicitationRequiredError is None:  # pragma: no cover
+        pytest.skip("this mcp version has no URL elicitation")
+    with pytest.raises(UrlElicitationRequiredError) as info:
+        await _scratch_server().call_tool("elicit", {})
+
+    assert info.value.error.message == "URL elicitation required"
+    assert [e.elicitationId for e in info.value.elicitations] == ["e1"]
 
 
 def test_the_registry_server_is_the_redacting_subclass() -> None:
@@ -279,6 +344,27 @@ def test_the_log_filter_redacts_args_and_tracebacks() -> None:
     assert "xox" not in message
     assert record.args is None
     assert record.exc_info is None
+
+
+def test_the_log_filter_never_raises_on_mismatched_args() -> None:
+    seen: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            seen.append(record.getMessage())
+
+    logger = logging.getLogger("slack_mcp.tests.mismatched")
+    handler = _Collect()
+    logger.addHandler(handler)
+    logger.propagate = False
+    install_log_redaction(logger)
+    try:
+        logger.warning("two %s %s", FAKE_BOT)  # one argument for two placeholders
+    finally:
+        logger.removeHandler(handler)
+        logger.propagate = True
+
+    assert seen == ["two %s %s ('***',)"]
 
 
 def test_install_log_redaction_is_idempotent() -> None:
@@ -334,6 +420,7 @@ async def test_the_stdio_server_scrubs_responses_and_stderr() -> None:
             (3, {"name": "slack_get_history", "arguments": {"params": {"channel": FAKE_BOT}}}),
             (4, {"name": FAKE_BOT, "arguments": {}}),
             (5, {"name": "slack_get_history", "arguments": FAKE_BOT}),  # malformed: not an object
+            (6, {"name": "slack_get_history", "arguments": FAKE_LONG}),  # ditto, repr cut to head...tail
         ]:
             reply = await send({"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": params})
             assert reply is not None
@@ -345,13 +432,17 @@ async def test_the_stdio_server_scrubs_responses_and_stderr() -> None:
 
     assert listed is not None
     assert len(listed["result"]["tools"]) == len(await mcp.list_tools())
-    history, unknown, malformed = replies
+    history, unknown, malformed, malformed_long = replies
     assert history["result"]["isError"] is True
     assert "got '***'" in history["result"]["content"][0]["text"]
     assert unknown["result"]["content"][0]["text"] == "Unknown tool: ***"
-    assert malformed["error"]["message"] == "Invalid request parameters"
+    assert malformed["error"]["message"] == malformed_long["error"]["message"] == "Invalid request parameters"
     assert FAKE_BOT not in json.dumps(replies)
+    assert FAKE_LONG[-16:] not in json.dumps(replies)
     # The SDK logged both the unknown name and the malformed request — scrubbed.
     assert "Tool '***' not listed" in stderr, stderr
     assert "Failed to validate request" in stderr, stderr
     assert "xox" not in stderr, stderr
+    # pydantic's truncated repr keeps the token's TAIL, which no token pattern can match.
+    assert FAKE_LONG[-16:] not in stderr, stderr
+    assert "input_value=<redacted>, input_type=str]" in stderr, stderr

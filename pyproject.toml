@@ -29,7 +29,11 @@ dependencies = [
     # `mcp.server.mcpserver.MCPServer`) and moves `mcp.types` out to the separate
     # `mcp-types` package, so an unbounded spec makes `uvx amazing-slack-mcp` resolve
     # to 2.x and die with ModuleNotFoundError on import.
-    "mcp>=1.1.0,<2",
+    # Floor 1.21.1: `ToolAnnotations` / `tool(annotations=)` need 1.7.0, but 1.7.0-1.21.0
+    # import `pydantic._internal._typing_extra.eval_type_backport`, which current pydantic
+    # (2.14) no longer has, and their metadata allows any pydantic < 3 — so a resolve can
+    # pair them and die with ImportError. 1.21.1 is the first that imports (measured).
+    "mcp>=1.21.1,<2",
     "httpx>=0.27",
     "pydantic>=2.7",
     "pydantic-settings>=2.4",
@@ -59,7 +63,7 @@ packages = ["src/slack_mcp"]
 dev = [
     # mcp[cli] provides the `mcp` dev CLI (mcp dev / inspector); the runtime
     # server needs only core `mcp`, so the CLI extra lives here.
-    "mcp[cli]>=1.1.0,<2",
+    "mcp[cli]>=1.21.1,<2",
     "pre-commit>=4.0",
     "ruff>=0.11",
     "mypy>=1.14",

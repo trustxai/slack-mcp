@@ -24,7 +24,9 @@ _MIN_REDACT_LEN = 8
 # Any Slack-shaped token, whatever its family, configured or not: `xoxp-…`, `xoxb-…`,
 # `xapp-…`, `xwfp-…`, and the rotating `xoxe.xoxp-…` / `xoxe.xapp-…` forms. Token bodies
 # are alphanumerics and dashes only, so a sentence's trailing period is left alone.
-_TOKEN_RE = re.compile(r"(?:xox[a-z]|xapp|xwfp)(?:\.(?:xox[a-z]|xapp))?-[A-Za-z0-9-]{10,}")
+# Case-insensitive: `_describe` upper-cases a validation error's location, so a
+# token-shaped field name reaches this pattern as `XOXB-…`.
+_TOKEN_RE = re.compile(r"(?:xox[a-z]|xapp|xwfp)(?:\.(?:xox[a-z]|xapp))?-[A-Za-z0-9-]{10,}", re.IGNORECASE)
 
 _TOKEN_HINT = (
     "The user token is missing, invalid, revoked or expired. Re-install your Slack app in this workspace and put "

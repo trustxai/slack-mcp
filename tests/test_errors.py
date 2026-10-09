@@ -234,6 +234,28 @@ def test_redaction_of_unconfigured_slack_tokens_by_pattern(monkeypatch: pytest.M
     assert redact_credentials(f"Slack echoed {token}.") == "Slack echoed ***."
 
 
+@pytest.mark.parametrize("token", ["XOXB-FAKE-0123456789ABCDEF", "XOXE.XOXP-1-FAKE0123456789", "XAPP-1-A0123-FAKE0123"])
+def test_redaction_pattern_ignores_case(monkeypatch: pytest.MonkeyPatch, token: str) -> None:
+    _use_settings(monkeypatch, Settings())
+    assert redact_credentials(f"Slack echoed {token}.") == "Slack echoed ***."
+
+
+def test_an_upper_cased_token_shaped_field_name_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_describe` upper-cases the location BEFORE redaction, so the field name arrives as XOXB-…."""
+    _use_settings(monkeypatch, Settings())
+
+    class _Model(BaseModel):
+        model_config = {"extra": "forbid"}
+
+    field = "xoxb-1234567890-abcdefghij"
+    with pytest.raises(ValidationError) as info:
+        _Model.model_validate({field: 1})
+    message = handle_api_error(info.value)
+
+    assert message == "Error: invalid input – ***: Extra inputs are not permitted"
+    assert field.upper() not in message
+
+
 def test_redaction_leaves_short_or_prefix_only_mentions_alone(monkeypatch: pytest.MonkeyPatch) -> None:
     _use_settings(monkeypatch, Settings())
     text = "expected xoxp-… or xoxe.xoxp-…; xoxb-short is fine"
