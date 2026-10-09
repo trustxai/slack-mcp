@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 
-from mcp.server.fastmcp import FastMCP
+from slack_mcp.safety import RedactingFastMCP, install_log_redaction
 
-mcp = FastMCP("slack_mcp")
+# RedactingFastMCP: every tool-call error the SDK raises — including argument-validation
+# failures that happen BEFORE a tool body runs — is redacted and stripped of the raw
+# input echo (see safety.py). Tools still register with the plain `@mcp.tool(...)`.
+mcp = RedactingFastMCP("slack_mcp")
 
 # FastMCP configures root logging at INFO to stderr, which MCP clients persist to log
 # files. At INFO, httpx logs one "HTTP Request: ..." line per call — the URL names the
@@ -14,6 +17,9 @@ mcp = FastMCP("slack_mcp")
 # DEBUG today; it is pinned too.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+# The SDK's own log lines can quote what a client sent (an unknown tool name, a malformed
+# request); scrub them on the stderr handler FastMCP just installed.
+install_log_redaction()
 
 # Register all tools (side-effect imports via decorators)
 from slack_mcp.tools import register_all  # noqa: E402

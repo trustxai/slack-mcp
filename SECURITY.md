@@ -73,7 +73,12 @@ Only the latest release on PyPI receives fixes.
   is not listed in `SLACK_WRITE_CHANNELS`.
 - A bot, app-level or browser session token being accepted.
 - The token (or any `xox…` / `xapp-…` string) appearing in any tool output — successful
-  or not — log line or error message.
+  or not — log line or error message. That includes what the MCP SDK says on the
+  server's behalf: an argument rejected before the tool runs (its value is never echoed
+  back as `input_value`, and a value a validator quotes is redacted), an unknown tool,
+  prompt or resource name, and the SDK's own lines on stderr. Any `input_value=` echo
+  in a log line is dropped whole, because pydantic cuts a long value to its first and
+  last characters and the tail of a token no longer looks like one.
 - A write being retried automatically, or reported as done when Slack did not confirm it.
 
 ## Running it safely
