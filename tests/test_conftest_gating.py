@@ -8,6 +8,7 @@ checked is the real collection hook, not a re-implementation of it.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -138,3 +139,63 @@ def test_live_write_needs_the_token_too(tmp_path: Path) -> None:
 )
 def test_selects_live_write(markexpr: str | None, expected: bool) -> None:
     assert selects_live_write(markexpr) is expected
+
+
+# -- the REAL tests/test_live_write.py under the standard gates ------------------------
+
+REPO = Path(__file__).resolve().parent.parent
+LIVE_WRITE_FILE = REPO / "tests" / "test_live_write.py"
+
+
+def _run_real_live_write_file(tmp_path: Path, markexpr: str) -> str:
+    """Run pytest on the real live-write module, ARMED, with the repo's own config.
+
+    SLACK_API_URL points at a closed loopback port, so even a broken gate could not reach
+    Slack with the fake token; cwd is a temp dir so no `.env` is read by Settings.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("SLACK_")}
+    env.pop("PYTEST_ADDOPTS", None)
+    env.update(ARMED)
+    env["SLACK_API_URL"] = "http://127.0.0.1:9/api/"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-rs",
+            "-p",
+            "no:cacheprovider",
+            "-c",
+            str(REPO / "pyproject.toml"),
+            "--rootdir",
+            str(REPO),
+            "-m",
+            markexpr,
+            str(LIVE_WRITE_FILE),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=tmp_path,
+    )
+    return result.stdout + result.stderr
+
+
+def _live_write_test_count() -> int:
+    return len(re.findall(r"^(?:async )?def test_", LIVE_WRITE_FILE.read_text(), flags=re.MULTILINE))
+
+
+def test_the_real_live_write_file_is_deselected_by_the_standard_gate(tmp_path: Path) -> None:
+    count = _live_write_test_count()
+    assert count >= 1
+    out = _run_real_live_write_file(tmp_path, "not live and not live_write")
+    assert f"{count} deselected" in out, out
+    assert "passed" not in out and "failed" not in out and "error" not in out.lower(), out
+
+
+def test_the_real_live_write_file_is_skipped_under_not_live_even_when_armed(tmp_path: Path) -> None:
+    count = _live_write_test_count()
+    out = _run_real_live_write_file(tmp_path, "not live")
+    assert f"{count} skipped" in out, out
+    assert "passed" not in out and "failed" not in out and "xfail" not in out, out
