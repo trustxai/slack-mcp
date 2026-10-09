@@ -142,6 +142,18 @@ async def test_search_with_no_matches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "More available" not in result
 
 
+async def test_search_past_the_last_page_says_which_page_is_last(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(routes={"search.messages": _body([], total=42, page=5, pages=3)})
+    _patch(monkeypatch, fake)
+
+    result = await slack_search_messages(SearchMessagesInput(query="deploy", page=5))
+
+    assert "**42** match(es) in total — page 5 of 3 (0 on this page" in result
+    assert result.splitlines()[-1] == "Page 5 is past the last page (3) — pass `page` ≤ 3."
+    assert "No messages matched" not in result
+    assert "More available" not in result
+
+
 async def test_search_caps_markdown_rows_and_clips_long_texts(monkeypatch: pytest.MonkeyPatch) -> None:
     matches = [_match(i, text="x" * 5000 if i == 0 else f"hit {i}") for i in range(60)]
     fake = _FakeClient(routes={"search.messages": _body(matches, total=60, page=1, pages=1)})
@@ -230,11 +242,24 @@ async def test_search_tool_is_read_only_and_documents_the_syntax() -> None:
     assert tool.annotations.destructiveHint is False
     assert tool.annotations.idempotentHint is True
     description = tool.description or ""
-    for needle in ("USER-TOKEN ONLY", "search:read", "in:#channel", "from:@user", "after:YYYY-MM-DD", "is:thread"):
+    needles = (
+        "USER-TOKEN ONLY",
+        "search:read",
+        "in:#channel-name",
+        "in:<@U0123ABCDEF>",
+        "from:<@U0123ABCDEF>",
+        "after:YYYY-MM-DD",
+        "before:YYYY-MM-DD",
+        "is:thread",
+    )
+    for needle in needles:
         assert needle in description, needle
-    # research 02 O-16: a bare `has:link` is undocumented — never advertise it.
-    assert "has:link" not in description
-    assert "has:link" not in json.dumps(tool.inputSchema)
+    # research 02 §4.18 / O-16: a bare `has:link` and the `in:<#C…>` form are not documented for
+    # search.messages (they can silently match nothing) — never advertise them.
+    schema = json.dumps(tool.inputSchema)
+    for undocumented in ("has:link", "in:<#"):
+        assert undocumented not in description, undocumented
+        assert undocumented not in schema, undocumented
 
 
 @pytest.mark.live

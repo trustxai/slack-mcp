@@ -39,7 +39,7 @@ class SearchMessagesInput(BaseModel):
         max_length=500,
         description=(
             "Slack search query, sent verbatim. Words plus modifiers, e.g. "
-            '`deploy in:#eng from:@ada after:2026-10-01`, `"exact phrase" -draft`, `in:<#C0123ABCDEF>`, '
+            '`deploy in:#eng from:@ada after:2026-10-01`, `"exact phrase" -draft`, `in:<@U0123ABCDEF>` (a DM), '
             "`from:<@U0123ABCDEF>`, `is:thread`, `has:pin`, `before:2026-10-09`, `on:2026-10-08`, `during:2026`."
         ),
     )
@@ -154,10 +154,16 @@ def _render_markdown(params: SearchMessagesInput, body: Mapping[str, Any]) -> st
         )
     lines.append("")
     if not matches:
-        lines.append(
-            "_No messages matched._ Results follow the search filters set in your Slack UI; check the modifiers "
-            "(in:#channel, from:@user, after:YYYY-MM-DD)."
+        past_the_end = (
+            isinstance(total, int) and total > 0 and isinstance(page, int) and isinstance(pages, int) and page > pages
         )
+        if past_the_end:
+            lines.append(f"Page {page} is past the last page ({pages}) — pass `page` ≤ {pages}.")
+        else:
+            lines.append(
+                "_No messages matched._ Results follow the search filters set in your Slack UI; check the modifiers "
+                "(in:#channel-name, from:@user, after:YYYY-MM-DD)."
+            )
         return clip_response("\n".join(lines))
     for index, match in enumerate(matches[:MAX_DISPLAY_ROWS], start=1):
         lines.append(_render_match(index, match))
@@ -186,7 +192,7 @@ async def slack_search_messages(params: SearchMessagesInput) -> str:
 
     Query syntax (combine freely):
     - `"exact phrase"`, `-word` to exclude a word
-    - `in:#channel` or `in:<#C0123ABCDEF>`; `in:<@U0123ABCDEF>` for a DM; `-in:#channel`
+    - `in:#channel-name`; `in:<@U0123ABCDEF>` for a DM; `-in:#channel-name`
     - `from:@user` or `from:<@U0123ABCDEF>`; `-from:@user`; `with:@user`
     - `after:YYYY-MM-DD`, `before:YYYY-MM-DD`, `on:YYYY-MM-DD`, `during:2026` / a month
     - `is:thread`, `is:saved`, `has:pin`, `has::eyes:` (has that reaction)

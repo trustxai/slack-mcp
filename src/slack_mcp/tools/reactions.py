@@ -86,7 +86,7 @@ def _with_warnings(text: str, body: dict[str, Any]) -> str:
     ),
 )
 async def slack_add_reaction(params: ReactionInput) -> str:
-    """Add an emoji reaction to a message, as you. 🔒 write.
+    """Add an emoji reaction to a message, as you.
 
     Calls `reactions.add` with the conversation id, the message `timestamp` and the
     emoji short name (colons stripped). The reaction is added AS YOU — it shows under
@@ -154,7 +154,7 @@ async def slack_add_reaction(params: ReactionInput) -> str:
     ),
 )
 async def slack_remove_reaction(params: ReactionInput) -> str:
-    """Remove one of YOUR emoji reactions from a message. 🔒 write.
+    """Remove one of YOUR emoji reactions from a message.
 
     Calls `reactions.remove` with the conversation id, the message `timestamp` and the
     emoji short name (colons stripped). It acts AS YOU, so it can only remove a reaction

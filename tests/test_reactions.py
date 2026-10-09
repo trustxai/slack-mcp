@@ -144,12 +144,14 @@ async def test_remove_reaction_no_reaction_is_a_success_like_outcome(monkeypatch
 
     result = await slack_remove_reaction(_input())
 
-    assert not result.startswith("Error")
-    assert "was not on message" in result
-    assert "(Slack: no_reaction) — nothing to remove" in result
+    assert result == (
+        f"Reaction :thumbsup: was not on message {TS} in {CHANNEL} as yours (Slack: no_reaction) — nothing to "
+        "remove; your reaction is absent, as asked."
+    )
+    assert fake.calls == [("reactions.remove", {"channel": CHANNEL, "timestamp": TS, "name": "thumbsup"})]
 
 
-async def test_remove_reaction_does_not_swallow_already_reacted(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_remove_reaction_named_error_is_rendered_with_its_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     # Only the method's own "end state reached" code is an outcome; any other code is an error.
     fake = _FakeClient(routes={"reactions.remove": SlackApiError("message_not_found", method="reactions.remove")})
     _patch(monkeypatch, fake)
@@ -158,6 +160,28 @@ async def test_remove_reaction_does_not_swallow_already_reacted(monkeypatch: pyt
 
     assert result.startswith("Error (message_not_found): Slack refused reactions.remove: message_not_found.")
     assert "check channel AND ts" in result
+
+
+async def test_remove_reaction_does_not_treat_already_reacted_as_an_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    # already_reacted is add's outcome code; on remove it stays an error.
+    fake = _FakeClient(routes={"reactions.remove": SlackApiError("already_reacted", method="reactions.remove")})
+    _patch(monkeypatch, fake)
+
+    result = await slack_remove_reaction(_input())
+
+    assert result.startswith("Error (already_reacted): Slack refused reactions.remove: already_reacted.")
+    assert fake.calls == [("reactions.remove", {"channel": CHANNEL, "timestamp": TS, "name": "thumbsup"})]
+
+
+async def test_add_reaction_does_not_treat_no_reaction_as_an_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    # no_reaction is remove's outcome code; on add it stays an error.
+    fake = _FakeClient(routes={"reactions.add": SlackApiError("no_reaction", method="reactions.add")})
+    _patch(monkeypatch, fake)
+
+    result = await slack_add_reaction(_input())
+
+    assert result.startswith("Error (no_reaction): Slack refused reactions.add: no_reaction.")
+    assert fake.calls == [("reactions.add", {"channel": CHANNEL, "timestamp": TS, "name": "thumbsup"})]
 
 
 async def test_remove_reaction_writes_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -210,6 +234,8 @@ async def test_reaction_tools_are_registered_with_write_annotations() -> None:
     )
     for name in ("slack_add_reaction", "slack_remove_reaction"):
         description = tools[name].description or ""
+        # gen_tool_table.py adds the 🔒 from the annotations; a lock in the summary would double it.
+        assert "🔒" not in description.splitlines()[0]
         assert "AS YOU" in description
         assert "Refused unless `SLACK_ALLOW_WRITES=1` AND the target is allowed by" in description
         assert "never retried" in description
