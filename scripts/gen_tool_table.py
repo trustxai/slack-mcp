@@ -36,7 +36,9 @@ END = "<!-- TOOL TABLE END -->"
 
 
 def _first_line(doc: str | None) -> str:
-    return (doc or "").strip().splitlines()[0].strip() if doc else ""
+    # The 🔒 column comes from the annotations; a docstring line ending in its own 🔒 would show it twice.
+    line = (doc or "").strip().splitlines()[0].strip() if doc else ""
+    return line.removesuffix("🔒").rstrip()
 
 
 def build_table() -> str:
