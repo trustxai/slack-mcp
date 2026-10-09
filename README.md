@@ -23,7 +23,8 @@ refused before anything is sent. Bots belong to a bot gateway (such as Hermes), 
 
 ## Safety model
 
-All the rails live in the HTTP client, not in the tools, so no tool can forget them:
+The write rails (kill-switch, allowlists, the closed method list, no write retry) live in
+the HTTP client, not in the tools, so no tool can forget them:
 
 - **Writes are off by default.** Posting, replying, editing, scheduling, reacting and
   opening DMs return `Error: … writes are disabled` until `SLACK_ALLOW_WRITES=1`. Reads
@@ -36,7 +37,8 @@ All the rails live in the HTTP client, not in the tools, so no tool can forget t
   `slack_open_conversation` (every id must be in `SLACK_WRITE_USERS`) and post to the
   `D…` / `G…` id it returns.
 - **Your self-DM needs no allowlist entry.** Once `SLACK_ALLOW_WRITES=1`, the DM with
-  yourself always passes, which makes it a good place to try writes out.
+  yourself passes without any allowlist entry, which makes it a good place to try writes
+  out.
 - **Slack Connect only by explicit listing.** A channel or group DM shared outside the
   workspace (any of `is_shared`, `is_ext_shared`, `is_org_shared`,
   `is_pending_ext_shared`) is writable only if you list its conversation id in
@@ -52,16 +54,18 @@ All the rails live in the HTTP client, not in the tools, so no tool can forget t
 - **No delete tool.** There is no tool to delete a message or to cancel a scheduled one.
   The server never joins a channel on its own, and it can only call the Slack methods on
   its built-in list.
-- **No token in any output.** Every tool result and error is scrubbed of the configured
-  token and of anything shaped like a Slack token (Slack echoes tokens in some error
-  bodies). The HTTP library's one-line-per-request logs are silenced.
+- **No token in tool output.** Every result and error a tool returns is scrubbed of the
+  configured token and of anything shaped like a Slack token (Slack echoes tokens in some
+  error bodies). The one exception is an invalid-argument error raised by the MCP SDK
+  before a tool runs, which quotes the arguments you sent back to you unchanged. The HTTP
+  library's one-line-per-request logs are silenced.
 - **Text from other people is data, not instructions.** History, threads and search
   results contain messages anyone in the workspace could have written. Don't let your
   agent follow instructions found in them, and keep your MCP client's approval prompt on
   for the 🔒 tools: the guard is a backstop, not a replacement for that prompt.
 
 The server stores nothing on disk. The user directory used by `slack_resolve_user` and
-the guard's conversation lookups are kept in memory for the life of the process. Slack's
+the guard's conversation lookups (reused for five minutes) are kept in memory only. Slack's
 Developer Policy forbids using Slack data to train an LLM. This server only returns what
 you ask for to your MCP client; what the client keeps is set by the client.
 
@@ -81,13 +85,15 @@ every one is in the [table](#available-tools).
   A user token can read any public channel without joining it.
   `slack_open_conversation` 🔒 opens (or finds) a DM or a group DM with 1–8 people.
 - **Users.** `slack_list_users`, `slack_get_user` and `slack_lookup_user_by_email`
-  (exact match). `slack_resolve_user` is the name → id resolver. It reads the directory
-  once per process, then ranks people by similarity to a name, display name or @handle,
-  ignoring case and accents. It calls out a unique match together with the `<@U…>`
+  (exact match). `slack_resolve_user` is the name → id resolver. It reads up to 20 pages of the
+  directory (about 4,000 people) on first use and answers from that per-process cache
+  afterwards (`refresh=true` re-reads it), then ranks people by similarity to a name,
+  display name or @handle, ignoring case and accents. It calls out a unique match together with the `<@U…>`
   string that mentions that person.
 - **Chat.** `slack_post_message` 🔒, `slack_reply_in_thread` 🔒, `slack_update_message` 🔒
   (your own messages only) and `slack_schedule_message` 🔒 (in the future, at most 120
-  days ahead). Text goes out verbatim, and each tool has a `format` switch:
+  days ahead). Text goes out verbatim (only leading and trailing whitespace is trimmed),
+  and each tool has a `format` switch:
   `"mrkdwn"` (default, Slack's own syntax) or `"markdown"` (real Markdown, sent as
   `markdown_text`). After a post or a thread reply, the confirmation includes the
   message's permalink. If the permalink lookup fails, the message is still reported as
@@ -104,11 +110,11 @@ every one is in the [table](#available-tools).
   kind, the granted scopes compared with the 15 the tools need, and the write-guard
   state.
 
-Read tools take `response_format: "markdown"` (default) or `"json"` (the raw Slack
-objects). Markdown output is capped at 50 rows per call. Cursor-paginated tools print
+Read tools other than `slack_health_check` take `response_format: "markdown"`
+(default) or `"json"` (the raw Slack objects). Markdown output is capped at 50 rows per call. Cursor-paginated tools print
 `next_cursor` verbatim and never walk more than one page per call. Search pages by
-number. The one exception is `slack_resolve_user`, which reads the whole directory into
-its cache on first use.
+number. The one exception is `slack_resolve_user`, which reads up to 20 pages of the directory
+into its cache on first use and says so when the index is partial.
 
 ## Available Tools
 
@@ -186,8 +192,7 @@ and one Slack app **per workspace**, created by you, for you:
 4. **Manage Distribution: leave public distribution OFF.** Turning it on makes the app an
    *unlisted distributed* app. Under Slack's 2025 rate-limit change, new installs of
    those apps drop to 1 request a minute on history and threads, while internal apps keep
-   their limits. An undistributed
-   app lives in a single workspace, which is why a second workspace needs a second app.
+   their limits. An undistributed app lives in a single workspace, which is why a second workspace needs a second app.
 5. **Install to Workspace** → allow → copy the **User OAuth Token** (`xoxp-…`). That
    value is your `SLACK_USER_TOKEN`.
 
@@ -244,8 +249,10 @@ Keep the token out of config files where you can. Two ways to do that:
   (`${NAME}`) expand variables from the environment the client was started in.
 - **1Password `op run`.** Launch the server as `op run -- uvx amazing-slack-mcp` and set
   `SLACK_USER_TOKEN` to an `op://vault/item/field` reference. `op run` swaps in the
-  secret only in the subprocess's environment. This works in any client, and it is the
-  simplest way to give two entries two different tokens.
+  secret only in the subprocess's environment. This works in any client that can launch a
+  command, provided the `op` CLI is installed and signed in where the client runs (use
+  absolute paths if the client has a minimal PATH), and it is the simplest way to give two
+  entries two different tokens.
 
 ### Claude Code
 
@@ -336,11 +343,11 @@ env = { SLACK_USER_TOKEN = "op://Private/slack-masava/credential", SLACK_WRITE_U
 
 Settings → Developer → Edit Config opens `claude_desktop_config.json` (on macOS:
 `~/Library/Application Support/Claude/claude_desktop_config.json`). Add the same
-`mcpServers` block as in the Cursor example. Use a literal token or the `op run` form,
-because this file has no `${env:…}` syntax. Quit Desktop *before* you edit the file:
-a running Desktop has been seen to write its in-memory copy back over edits. Restart
-Desktop afterwards. If Desktop cannot find
-`uvx`, use its absolute path (`which uvx`).
+`mcpServers` block as in the Cursor example. Desktop's config file is not documented to
+expand environment variables, so use a literal token or the `op run` form. Quit Desktop
+*before* you edit the file: a running Desktop has been seen to write its in-memory copy
+back over edits. Restart Desktop afterwards. If Desktop cannot find `uvx` or `op`, use
+their absolute paths (`which uvx`, `which op`).
 
 Mind the tool budget. Claude Desktop's cloud (Cowork) sessions publish your local MCP
 tools when they start, and a session has been seen to fail to start once the total tool
@@ -357,8 +364,8 @@ npx @modelcontextprotocol/inspector uvx amazing-slack-mcp
 ```
 
 Open the Tools tab and run `slack_health_check`. From a clone,
-`uv run mcp dev src/slack_mcp/server.py` does the same (the `mcp` dev CLI ships in the
-dev dependency group).
+`npx @modelcontextprotocol/inspector uv run amazing-slack-mcp` does the same against your
+working tree.
 
 ## Environment variables
 
@@ -368,13 +375,13 @@ changing one. String values are whitespace-stripped. Real environment variables 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SLACK_USER_TOKEN` | *(empty)* | **Required.** Your app's User OAuth Token (`xoxp-…`), sent as `Authorization: Bearer …`. Any other token kind is refused with a message naming the kind; the value is never echoed. |
+| `SLACK_USER_TOKEN` | *(empty)* | **Required.** Your app's User OAuth Token (`xoxp-…`), sent as `Authorization: Bearer …`. Any other token is refused (known kinds such as `xoxb-`, `xapp-`, `xoxc-` by name), and the value is never echoed. |
 | `SLACK_ALLOW_WRITES` | off | Kill-switch. `1` allows posting, replying, editing, scheduling, reacting and opening DMs, and even then every write must pass the allowlists. |
 | `SLACK_WRITE_CHANNELS` | *(empty)* | Comma-separated conversation IDs (`C…`, `G…`, `D…`) a write may target. IDs only; a `#name` never matches. The only way to write to a Slack Connect channel or a shared group DM. |
 | `SLACK_WRITE_USERS` | *(empty)* | Comma-separated user IDs (`U…`, `W…`). A DM or group DM is writable when every *other* member is listed, and `slack_open_conversation` only opens conversations with these people. Your own self-DM needs no entry. |
 | `SLACK_API_URL` | `https://slack.com/api` | Web API base URL, for proxies and tests. Must be `https://`; plain `http://` is accepted only for `127.0.0.1` / `localhost`. |
 | `SLACK_REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout. A timed-out write is reported as outcome UNKNOWN, never retried. |
-| `SLACK_TEST_ALLOW_WRITES` | *(unset)* | **Test suite only**, never read by the server. `1` opens the `live_write` tests, but only when exported inline on the command line (a value in `.env` is ignored) and only with `-m live_write`. See [Running the tests](#running-the-tests). |
+| `SLACK_TEST_ALLOW_WRITES` | *(unset)* | **Test suite only**, never read by the server. `1` opens the `live_write` tests, but only when it is in the environment pytest starts with (a value in `.env` is ignored for this variable) and only with exactly `-m live_write`. See [Running the tests](#running-the-tests). |
 
 ## Formatting cheatsheet
 
@@ -389,15 +396,15 @@ Markdown:
 | Bold / italic / strike | `*bold*` (single asterisks; `**x**` is not bold), `_italic_`, `~strike~` |
 | Code | `` `inline` `` and ```` ```block``` ```` |
 | Quote | `> quoted line` |
-| Notify everyone | `<!here>`, `<!channel>`. These go out as you, to everyone in the channel. |
+| Notify everyone | `<!channel>` notifies every member and `<!here>` only the active ones; both go out as you. |
 | Headings, lists | mrkdwn has no headings and no list syntax. Write `•` or `-` lines as plain text, or use `format: "markdown"`. |
 | A literal `&`, `<` or `>` | escape only those three: `&amp;`, `&lt;`, `&gt;` |
 
 Set `format: "markdown"` to write ordinary Markdown instead (`**bold**`, `# heading`,
 `[label](url)`, lists). The same string is sent as Slack's `markdown_text`, which holds
 at most **12,000 characters**. Mentions still need the `<@U…>` form. The other limits:
-`slack_post_message` and `slack_reply_in_thread` accept up to 40,000 characters of
-mrkdwn, and `slack_update_message` up to 4,000.
+`slack_post_message`, `slack_reply_in_thread` and `slack_schedule_message` accept up to
+40,000 characters of mrkdwn, and `slack_update_message` up to 4,000.
 
 ## Running the tests
 
@@ -405,19 +412,19 @@ mrkdwn, and `slack_update_message` up to 4,000.
 uv sync --group dev
 uv run pytest -m "not live and not live_write"          # the gate — never touches Slack
 uv run pytest -m live                                   # read-only smoke; needs SLACK_USER_TOKEN (shell or .env)
-SLACK_TEST_ALLOW_WRITES=1 uv run pytest -m live_write   # posts in YOUR self-DM only
+SLACK_TEST_ALLOW_WRITES=1 uv run pytest -m live_write   # the self-DM smoke (tests/test_live_write.py)
 ```
 
 - The default tier mocks every HTTP call and strips your real `SLACK_*` settings, so it
   runs anywhere.
 - `live` runs only the read-only smoke tests against your workspace, and only when
   `SLACK_USER_TOKEN` is set. Otherwise those tests are skipped.
-- `live_write` writes to Slack as you, in your own self-DM only, never a channel or
-  another person. It runs **only** when all three hold: the token is set,
-  `SLACK_TEST_ALLOW_WRITES=1` is exported inline on the command line exactly as shown
-  (a value in `.env` is ignored on purpose), and the marker expression is exactly
-  `-m live_write`. Nothing can delete what it posts, so the messages stay in your
-  self-DM.
+- `live_write` is the self-DM smoke (`tests/test_live_write.py`). It writes to Slack as
+  you, in your own self-DM only, never a channel or another person. It runs **only** when
+  all three hold: the token is set, `SLACK_TEST_ALLOW_WRITES=1` is in the environment
+  pytest starts with (set it inline as shown; a value in `.env` is ignored on purpose),
+  and the marker expression is exactly `-m live_write`. Nothing can delete what it posts,
+  so the messages stay in your self-DM.
 
 ## Troubleshooting
 
