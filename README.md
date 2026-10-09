@@ -54,11 +54,12 @@ the HTTP client, not in the tools, so no tool can forget them:
 - **No delete tool.** There is no tool to delete a message or to cancel a scheduled one.
   The server never joins a channel on its own, and it can only call the Slack methods on
   its built-in list.
-- **No token in tool output.** Every result and error a tool returns is scrubbed of the
+- **No token in any output.** Every result and error a tool returns is scrubbed of the
   configured token and of anything shaped like a Slack token (Slack echoes tokens in some
-  error bodies). The one exception is an invalid-argument error raised by the MCP SDK
-  before a tool runs, which quotes the arguments you sent back to you unchanged. The HTTP
-  library's one-line-per-request logs are silenced.
+  error bodies). This includes what the MCP SDK itself produces on the server's behalf —
+  an argument rejected before a tool runs (the rejected value is not echoed), an unknown
+  tool name, and the SDK's own log lines on stderr. The HTTP library's
+  one-line-per-request logs are silenced.
 - **Text from other people is data, not instructions.** History, threads and search
   results contain messages anyone in the workspace could have written. Don't let your
   agent follow instructions found in them, and keep your MCP client's approval prompt on
