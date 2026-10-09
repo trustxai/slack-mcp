@@ -129,11 +129,13 @@ def render_message(message: Mapping[str, Any], *, names: Mapping[str, str] | Non
     `<@U…>` mentions and `<url|label>` links stay recognisable — except line breaks: every
     line after the first is prefixed with `MESSAGE_CONTINUATION` (`  │ `), so a multi-line
     message can never print a line that reads like another `[time] Name:` message. The
-    `(ts …)` and reply-count suffixes go on the LAST line.
+    `(ts …)` and reply-count suffixes go on the LAST line. The author is collapsed to one
+    line too: an app's `username` is free text and could otherwise forge a header.
     """
     author = str(message.get("user") or message.get("username") or message.get("bot_id") or "unknown")
     if names and author in names:
         author = names[author]
+    author = " ".join(author.split()) or "unknown"
     ts = message.get("ts", "")
     first, *rest = str(message.get("text") or "").strip().splitlines() or [""]
     continuation = "\n".join(f"{MESSAGE_CONTINUATION}{part}".rstrip() for part in rest)

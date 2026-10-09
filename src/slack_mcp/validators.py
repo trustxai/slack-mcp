@@ -75,13 +75,15 @@ def _parse_time(value: object, *, field: str) -> int:
     """Epoch seconds from an int, a digit string, or an ISO-8601 date/datetime (naive = UTC).
 
     Epoch values must be SECONDS: a digit string needs 9-10 ASCII digits, and an int passes
-    as-is unless it has more than 10 digits. A 13-digit value is a millisecond epoch and is
-    rejected with a message saying so rather than divided silently: read as seconds it
-    would land ~54,000 years out, and guessing the unit is not this module's job.
+    as-is when it is 0 or positive with at most 10 digits (a negative int never does). A
+    13-digit value is a millisecond epoch and is rejected with a message saying so (and
+    "divide by 1000") rather than divided silently: read as seconds it would land ~54,000
+    years out, and guessing the unit is not this module's job. Other over-long values get
+    the plain "9–10 digits" message.
     """
     if isinstance(value, bool):
         raise ValueError(f"{field} must be an ISO-8601 datetime or epoch seconds, not a bool")
-    if isinstance(value, int) and value < 10**10:  # 0 and other small ints pass, as before
+    if isinstance(value, int) and 0 <= value < 10**10:  # 0 and other small ints pass, as before
         return value
     text = str(value).strip()
     if _EPOCH_RE.fullmatch(text):
@@ -90,10 +92,14 @@ def _parse_time(value: object, *, field: str) -> int:
         return int(text.split(".", 1)[0])
     integer = text.split(".", 1)[0]
     if _DIGITS_RE.fullmatch(integer) and len(integer) > 10:
-        unit = "milliseconds" if len(integer) == 13 else f"{len(integer)} digits"
+        if len(integer) == 13:
+            raise ValueError(
+                f"{field} must be epoch SECONDS (10 digits, e.g. 1712345678), got {text!r} — that looks like "
+                "milliseconds; divide by 1000 (or pass an ISO-8601 datetime)"
+            )
         raise ValueError(
-            f"{field} must be epoch SECONDS (10 digits, e.g. 1712345678), got {text!r} — that looks like "
-            f"{unit}; divide by 1000 (or pass an ISO-8601 datetime)"
+            f"{field} must be ISO-8601 or epoch seconds, and epoch seconds must be 9–10 digits "
+            f"(e.g. 1712345678), got {text!r} ({len(integer)} digits)"
         )
     if not text:
         raise ValueError(f"{field} must be an ISO-8601 datetime (e.g. 2026-10-09T15:00:00Z) or epoch seconds")

@@ -200,9 +200,23 @@ def test_iso_to_epoch_rejects_a_millisecond_epoch_naming_milliseconds(value: obj
     assert "divide by 1000" in str(info.value)
 
 
-@pytest.mark.parametrize("value", ["17123456781", "171234567812", "1712345678123456", 17123456781])
-def test_iso_to_epoch_rejects_other_over_long_epochs(value: object) -> None:
-    with pytest.raises(ValueError, match="post_at must be epoch SECONDS"):
+@pytest.mark.parametrize(
+    ("value", "digits"),
+    [("17123456781", 11), (17123456781, 11), ("171234567812", 12), ("1712345678123456", 16), (1712345678123456, 16)],
+)
+def test_iso_to_epoch_rejects_other_over_long_epochs_without_the_milliseconds_hint(value: object, digits: int) -> None:
+    with pytest.raises(ValueError, match="post_at must be ISO-8601 or epoch seconds") as info:
+        iso_to_epoch(value)
+    message = str(info.value)
+    assert "epoch seconds must be 9–10 digits" in message
+    assert f"({digits} digits)" in message
+    assert "milliseconds" not in message
+    assert "divide by 1000" not in message
+
+
+@pytest.mark.parametrize("value", [-1712345678000, -1712345678, -1])
+def test_iso_to_epoch_rejects_a_negative_int(value: int) -> None:
+    with pytest.raises(ValueError, match="post_at must be ISO-8601"):
         iso_to_epoch(value)
 
 

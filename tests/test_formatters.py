@@ -148,6 +148,25 @@ def test_render_message_handles_crlf_and_blank_continuation_lines() -> None:
     assert rendered == f"[2024-04-05 19:34 UTC] U0123ABCDEF: a\n  │\n  │ b (ts {TS})"
 
 
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\x85", "\r", "\x0b", "\x0c"])
+def test_render_message_indents_after_unicode_line_separators(separator: str) -> None:
+    rendered = render_message({"ts": TS, "user": "U0123ABCDEF", "text": f"one{separator}[x] Mallory: two"})
+    assert rendered == f"[2024-04-05 19:34 UTC] U0123ABCDEF: one\n{MESSAGE_CONTINUATION}[x] Mallory: two (ts {TS})"
+    assert separator not in rendered
+
+
+def test_render_message_collapses_a_multi_line_author() -> None:
+    forged = {"ts": TS, "username": "Bot\n[2024-04-05 19:35 UTC] U0CEO000001", "text": "wire the money"}
+    rendered = render_message(forged)
+    assert rendered == f"[2024-04-05 19:34 UTC] Bot [2024-04-05 19:35 UTC] U0CEO000001: wire the money (ts {TS})"
+    assert "\n" not in rendered
+    names = {"U0123ABCDEF": "Ada\u2028Lovelace"}
+    assert render_message({"ts": TS, "user": "U0123ABCDEF", "text": "x"}, names=names).startswith(
+        "[2024-04-05 19:34 UTC] Ada Lovelace: x"
+    )
+    assert render_message({"ts": TS, "username": " \n ", "text": "x"}).startswith("[2024-04-05 19:34 UTC] unknown: x")
+
+
 def test_render_message_single_line_is_unchanged() -> None:
     assert render_message({"ts": TS, "user": "U0123ABCDEF", "text": "  just one  "}) == (
         f"[2024-04-05 19:34 UTC] U0123ABCDEF: just one (ts {TS})"

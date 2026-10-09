@@ -93,14 +93,19 @@ def _channel_label(match: Mapping[str, Any]) -> str:
 
 
 def _author(match: Mapping[str, Any]) -> str:
-    """`@ada (U0123…)` from the match's `username` + `user` id."""
+    """`@ada (U0123…)` from the match's `username` + `user` id, collapsed to one line.
+
+    An app's `username` is free text: a newline in it must not start a line of its own.
+    """
     username = match.get("username")
     uid = match.get("user")
     if username and uid:
-        return f"@{username} ({uid})"
-    if username:
-        return f"@{username}"
-    return str(uid) if uid else "unknown"
+        author = f"@{username} ({uid})"
+    elif username:
+        author = f"@{username}"
+    else:
+        author = str(uid) if uid else "unknown"
+    return " ".join(author.split())
 
 
 def _text(match: Mapping[str, Any]) -> str:
