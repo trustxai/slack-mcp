@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -71,6 +72,23 @@ def _fresh_directory_cache() -> Iterator[None]:
     users.clear_user_cache()
     yield
     users.clear_user_cache()
+
+
+class _FakeClock:
+    """A monotonic clock that only moves when a test says so."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    fake = _FakeClock()
+    monkeypatch.setattr("slack_mcp.tools.users._clock", fake)
+    return fake
 
 
 def _user(
@@ -639,13 +657,134 @@ async def test_resolve_a_rate_limit_mid_walk_caches_the_pages_read_as_partial(
     )
     assert partial in first
     assert partial in second
-    assert "**Unique match**: Ada Lovelace (@ada, U0ADA000001)" in first
-    assert "**Unique match**: Ricardo Pérez (@Ricardo, U0RIC000001)" in second
+    # A unique match in a partial index is not the whole truth: the label says so.
+    partial_unique = "**Unique match in the PARTIAL index — confirm before writing**"
+    assert f"{partial_unique}: Ada Lovelace (@ada, U0ADA000001) — mention as `<@U0ADA000001>`." in first
+    assert f"{partial_unique}: Ricardo Pérez (@Ricardo, U0RIC000001)" in second
+    assert "**Unique match**:" not in first
     data = json.loads(await slack_resolve_user(ResolveUserInput(query="ada", response_format=ResponseFormat.JSON)))
     assert data["directory_complete"] is False
     assert data["directory_stopped"] == "rate_limited"
     assert data["people_indexed"] == 2
+    assert data["directory_notice"] is None
     assert len(fake.calls) == 2
+
+
+async def test_resolve_a_rate_limited_refresh_keeps_the_complete_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    pages: dict[str | None, Any] = dict(DIRECTORY_PAGES)
+    fake = _FakeClient({"users.list": _by_cursor(pages)})
+    _patch(monkeypatch, fake)
+
+    await slack_resolve_user(ResolveUserInput(query="ada"))  # complete walk: 2 pages, 6 people
+    pages["cGFnZTI="] = _http_429()
+    refreshed = await slack_resolve_user(ResolveUserInput(query="Grace", refresh=True))
+    later = await slack_resolve_user(ResolveUserInput(query="Grace"))
+
+    walk = [("users.list", {"limit": 200}), ("users.list", {"limit": 200, "cursor": "cGFnZTI="})]
+    # The refresh re-read both pages, hit the 429 on page 2, and kept the complete entry: no third walk.
+    assert fake.calls == walk + walk
+    assert (
+        "Re-reading the directory was rate-limited by Slack after 1 page(s); kept the directory cached earlier "
+        "(6 people)." in refreshed
+    )
+    # Grace lives on page 2, which the rate-limited refresh never re-read: the old entry still finds her.
+    assert "**Unique match**: Grace Ramírez (@grace, U0GRA000001)" in refreshed
+    assert "PARTIAL" not in refreshed
+    assert "**Unique match**: Grace Ramírez (@grace, U0GRA000001)" in later
+    assert "Re-reading" not in later
+    assert users._DIRECTORY_CACHE[users._cache_key()].complete is True
+
+
+async def test_resolve_a_rate_limited_refresh_on_page_one_keeps_the_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    pages: dict[str | None, Any] = dict(DIRECTORY_PAGES)
+    fake = _FakeClient({"users.list": _by_cursor(pages)})
+    _patch(monkeypatch, fake)
+
+    await slack_resolve_user(ResolveUserInput(query="ada"))
+    pages[None] = SlackApiError("ratelimited", method="users.list")
+    refreshed = await slack_resolve_user(ResolveUserInput(query="ada", refresh=True))
+
+    assert len(fake.calls) == 3
+    assert not refreshed.startswith("Error")
+    assert "after 0 page(s); kept the directory cached earlier (6 people)." in refreshed
+    assert "**Unique match**: Ada Lovelace" in refreshed
+
+
+async def test_resolve_refresh_after_a_rate_limited_partial_walks_from_page_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pages: dict[str | None, Any] = {**DIRECTORY_PAGES, "cGFnZTI=": _http_429()}
+    fake = _FakeClient({"users.list": _by_cursor(pages)})
+    _patch(monkeypatch, fake)
+
+    await slack_resolve_user(ResolveUserInput(query="ada"))  # partial: page 1 only
+    pages["cGFnZTI="] = DIRECTORY_PAGES["cGFnZTI="]
+    result = await slack_resolve_user(ResolveUserInput(query="Grace", refresh=True))
+
+    walk = [("users.list", {"limit": 200}), ("users.list", {"limit": 200, "cursor": "cGFnZTI="})]
+    assert fake.calls == walk + walk
+    entry = users._DIRECTORY_CACHE[users._cache_key()]
+    assert entry.complete is True
+    assert entry.stopped is None
+    assert len(entry.members) == 6
+    assert "PARTIAL" not in result
+    assert "**Unique match**: Grace Ramírez (@grace, U0GRA000001)" in result
+
+
+async def test_resolve_a_rate_limited_partial_is_rewalked_after_sixty_seconds(
+    monkeypatch: pytest.MonkeyPatch, clock: _FakeClock
+) -> None:
+    pages: dict[str | None, Any] = {**DIRECTORY_PAGES, "cGFnZTI=": _http_429()}
+    fake = _FakeClient({"users.list": _by_cursor(pages)})
+    _patch(monkeypatch, fake)
+    walk = [("users.list", {"limit": 200}), ("users.list", {"limit": 200, "cursor": "cGFnZTI="})]
+
+    await slack_resolve_user(ResolveUserInput(query="ada"))  # partial at t=1000
+    clock.now += 59.9
+    young = await slack_resolve_user(ResolveUserInput(query="Grace"))
+
+    assert fake.calls == walk  # under a minute: served from the partial cache
+    assert "PARTIAL" in young
+    assert "U0GRA000001" not in young  # Grace is on the page that was never read
+
+    # Still rate limited at t+60: the re-walk keeps the (as large) partial and restarts its clock.
+    clock.now = 1_060.0
+    still_limited = await slack_resolve_user(ResolveUserInput(query="ada"))
+    assert fake.calls == walk * 2
+    assert "kept the directory cached earlier (3 people)" in still_limited
+    clock.now = 1_119.0
+    await slack_resolve_user(ResolveUserInput(query="ada"))
+    assert fake.calls == walk * 2  # 59 s after the last attempt: no walk
+
+    # The budget is back: the next re-walk completes and replaces the partial.
+    pages["cGFnZTI="] = DIRECTORY_PAGES["cGFnZTI="]
+    clock.now = 1_120.0
+    healed = await slack_resolve_user(ResolveUserInput(query="Grace"))
+
+    assert fake.calls == walk * 3
+    assert "PARTIAL" not in healed
+    assert "**Unique match**: Grace Ramírez (@grace, U0GRA000001)" in healed
+    assert users._DIRECTORY_CACHE[users._cache_key()].complete is True
+
+
+async def test_a_page_cap_partial_is_not_rewalked_automatically(
+    monkeypatch: pytest.MonkeyPatch, clock: _FakeClock
+) -> None:
+    monkeypatch.setattr("slack_mcp.tools.users.MAX_RESOLVE_PAGES", 1)
+    fake = _FakeClient({"users.list": _by_cursor(DIRECTORY_PAGES)})
+    _patch(monkeypatch, fake)
+
+    await slack_resolve_user(ResolveUserInput(query="ada"))
+    clock.now += 3_600
+    await slack_resolve_user(ResolveUserInput(query="ada"))
+
+    # Another walk would stop at the same cap: only `refresh=true` re-reads it.
+    assert fake.calls == [("users.list", {"limit": 200})]
+
+
+def test_the_tool_module_does_not_import_httpx() -> None:
+    source = Path(users.__file__).read_text()
+    assert "httpx" not in source
 
 
 async def test_resolve_stops_at_the_page_cap_and_says_the_index_is_partial(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -664,6 +803,7 @@ async def test_resolve_stops_at_the_page_cap_and_says_the_index_is_partial(monke
     assert fake.calls == [("users.list", {"limit": 200}), ("users.list", {"limit": 200, "cursor": "more"})]
     # The people actually read, not pages × 200.
     assert "The directory index is PARTIAL: it stops after 2 pages and holds 3 people" in result
+    assert "**Unique match in the PARTIAL index — confirm before writing**: Ada Lovelace" in result
 
 
 def test_the_page_cap_is_about_one_tier_two_minute() -> None:

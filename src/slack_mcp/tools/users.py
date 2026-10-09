@@ -14,12 +14,12 @@ import asyncio
 import difflib
 import hashlib
 import re
+import time
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -78,6 +78,8 @@ class _Directory:
     complete: bool
     # Why the walk stopped early: "rate_limited" or "page_cap" (None when complete).
     stopped: str | None = None
+    # `_clock()` time of the last walk that produced or kept this entry.
+    walked_at: float = 0.0
 
 
 # Keyed by (base URL, sha256(token)[:12]): a test server and the real API never share an
@@ -85,6 +87,11 @@ class _Directory:
 _DIRECTORY_CACHE: dict[tuple[str, str], _Directory] = {}
 # Serialises the walk, so concurrent resolver calls on an empty cache read users.list once.
 _DIRECTORY_LOCK = asyncio.Lock()
+# Injectable monotonic clock (tests replace it).
+_clock: Callable[[], float] = time.monotonic
+# A rate-limited PARTIAL entry is re-walked automatically once it is this old: users.list
+# is Tier 2, whose budget is per minute.
+RATE_LIMITED_REWALK_SECONDS = 60.0
 
 
 def clear_user_cache() -> None:
@@ -104,10 +111,21 @@ def _cache_key() -> tuple[str, str]:
 
 
 def _is_rate_limit(exc: Exception) -> bool:
-    """An HTTP 429 (after the client's one bounded retry) or a `ratelimited` / `rate_limited` body."""
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code == 429
+    """An HTTP 429 (after the client's one bounded retry) or a `ratelimited` / `rate_limited` body.
+
+    The status is read by duck typing (`exc.response.status_code`), so the tool module's
+    only coupling to the transport stays `get_client().call(...)`.
+    """
+    if getattr(getattr(exc, "response", None), "status_code", None) == 429:
+        return True
     return isinstance(exc, SlackApiError) and exc.code in ("ratelimited", "rate_limited")
+
+
+def _needs_walk(cached: _Directory | None, refresh: bool) -> bool:
+    """Walk on a miss, on `refresh`, or when a rate-limited PARTIAL entry is old enough to retry."""
+    if cached is None or refresh:
+        return True
+    return cached.stopped == "rate_limited" and _clock() - cached.walked_at >= RATE_LIMITED_REWALK_SECONDS
 
 
 # --------------------------------------------------------------------------------------
@@ -298,24 +316,31 @@ def _score(query: str, user: Mapping[str, Any]) -> float:
     return best
 
 
-async def _load_directory(refresh: bool) -> _Directory:
-    """The cached directory for this base URL + token, walking the `users.list` pages on a miss.
+async def _load_directory(refresh: bool) -> tuple[_Directory, str | None]:
+    """The directory for this base URL + token, plus a notice when a re-walk was cut short.
 
-    The walk runs under a lock, and the cache is checked again once the lock is held, so
-    concurrent calls on an empty cache read the directory once. A rate limit after at
-    least one page caches what was read as PARTIAL (`stopped="rate_limited"`) instead of
-    failing, so later calls do not restart from page 1 and spend the users.list budget
-    again; `refresh=true` re-reads it. Any other error — or a rate limit on page 1 —
-    raises and caches nothing.
+    Walks the `users.list` pages on a miss, on `refresh`, and when a rate-limited PARTIAL
+    entry is at least `RATE_LIMITED_REWALK_SECONDS` old. The walk runs under a lock, and
+    the cache is checked again once the lock is held, so concurrent calls on an empty
+    cache read the directory once.
+
+    A rate limit mid-walk never makes the cache worse:
+    - with an earlier entry that is complete, or at least as large as what this walk
+      read, that entry is KEPT (its clock restarts) and the notice says so — a
+      rate-limited `refresh` never replaces a complete directory with a partial one;
+    - otherwise, if at least one page was read, it is cached as PARTIAL
+      (`stopped="rate_limited"`), so later calls do not restart from page 1;
+    - with nothing read and nothing cached, the error is raised.
+    Any other error raises and leaves the cache as it was.
     """
     key = _cache_key()
     cached = _DIRECTORY_CACHE.get(key)
-    if cached is not None and not refresh:
-        return cached
+    if cached is not None and not _needs_walk(cached, refresh):
+        return cached, None
     async with _DIRECTORY_LOCK:
         cached = _DIRECTORY_CACHE.get(key)
-        if cached is not None and not refresh:
-            return cached
+        if cached is not None and not _needs_walk(cached, refresh):
+            return cached, None
         client = get_client()
         members: list[dict[str, Any]] = []
         cursor: str | None = None
@@ -325,7 +350,15 @@ async def _load_directory(refresh: bool) -> _Directory:
             try:
                 body = await client.call("users.list", _compact({"limit": RESOLVE_PAGE_LIMIT, "cursor": cursor}))
             except Exception as exc:
-                if pages == 0 or not _is_rate_limit(exc):
+                if not _is_rate_limit(exc):
+                    raise
+                if cached is not None and (cached.complete or len(cached.members) >= len(members)):
+                    cached.walked_at = _clock()
+                    return cached, (
+                        f"Re-reading the directory was rate-limited by Slack after {pages} page(s); kept the "
+                        f"directory cached earlier ({len(cached.members):,} people)."
+                    )
+                if pages == 0:
                     raise
                 stopped = "rate_limited"
                 break
@@ -337,9 +370,11 @@ async def _load_directory(refresh: bool) -> _Directory:
             if pages >= MAX_RESOLVE_PAGES:
                 stopped = "page_cap"
                 break
-        directory = _Directory(members=members, pages=pages, complete=stopped is None, stopped=stopped)
+        directory = _Directory(
+            members=members, pages=pages, complete=stopped is None, stopped=stopped, walked_at=_clock()
+        )
         _DIRECTORY_CACHE[key] = directory
-        return directory
+        return directory, None
 
 
 # --------------------------------------------------------------------------------------
@@ -690,8 +725,9 @@ async def slack_resolve_user(params: ResolveUserInput) -> str:
     unique match with the `<@U…>` string to mention them (never for a query shorter than
     2 characters); several ≥ 0.90 are reported as ambiguous — confirm which one before
     writing. A PARTIAL directory (rate limited mid-walk, or past 20 pages) is said so,
-    with the number of people it holds. JSON mode returns the scores and ids plus
-    `unique_match`.
+    with the number of people it holds, and a unique match in it is labelled "Unique
+    match in the PARTIAL index — confirm before writing". JSON mode returns the scores
+    and ids plus `unique_match`.
 
     Examples:
     - `params = {"query": "Ricardo"}`
@@ -702,11 +738,13 @@ async def slack_resolve_user(params: ResolveUserInput) -> str:
     An empty query is rejected locally. `missing_scope` means the app lacks the USER
     scope `users:read`. A rate limit on the FIRST page is returned as the error (wait for
     Retry-After and call again; nothing is cached); a rate limit on a later page keeps
-    the pages already read as a PARTIAL directory — pass `refresh=true` after a minute
-    to re-read it whole.
+    the pages already read as a PARTIAL directory, which the next call re-reads from
+    page 1 once it is a minute old (or pass `refresh=true`). A rate-limited re-read
+    never replaces a complete (or larger) cached directory: the old one is kept and the
+    response says so.
     """
     try:
-        directory = await _load_directory(params.refresh)
+        directory, notice = await _load_directory(params.refresh)
         pool, hidden_deleted, hidden_bots = _split_hidden(
             directory.members, include_deleted=params.include_deleted, include_bots=params.include_bots
         )
@@ -729,6 +767,7 @@ async def slack_resolve_user(params: ResolveUserInput) -> str:
                         "directory_complete": directory.complete,
                         "directory_stopped": directory.stopped,
                         "people_indexed": len(directory.members),
+                        "directory_notice": notice,
                         "unique_match": unique.get("id") if unique else None,
                         "confident_matches": len(confident),
                         "matches": [
@@ -764,10 +803,17 @@ async def slack_resolve_user(params: ResolveUserInput) -> str:
                 f"The directory index is PARTIAL: it stops after {directory.pages} pages and holds "
                 f"{len(directory.members):,} people — use `slack_lookup_user_by_email` if the person is missing."
             )
+        if notice:
+            lines.append(notice)
         lines.append("")
         if unique is not None:
             uid = str(unique.get("id") or "")
-            lines.append(f"**Unique match**: {fmt_user(unique)} — mention as `{render_mention(uid)}`.")
+            label = (
+                "**Unique match**"
+                if directory.complete
+                else "**Unique match in the PARTIAL index — confirm before writing**"
+            )
+            lines.append(f"{label}: {fmt_user(unique)} — mention as `{render_mention(uid)}`.")
             lines.append("")
         elif too_short and top:
             lines.append(
