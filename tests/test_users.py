@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from collections.abc import Callable, Iterator
 from typing import Any
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -39,6 +41,8 @@ class _FakeClient:
 
     async def call(self, method: str, params: Any = None, **kwargs: Any) -> dict[str, Any]:
         self.calls.append((method, copy.deepcopy(params)))
+        # Yield like a real request, so concurrent callers actually interleave.
+        await asyncio.sleep(0)
         route = self._routes.get(method)
         if route is None:
             raise AssertionError(f"unexpected Slack method {method!r}")
@@ -162,6 +166,8 @@ async def test_list_users_can_include_deleted_and_bots_with_flags(monkeypatch: p
 
     result = await slack_list_users(ListUsersInput(include_deleted=True, include_bots=True))
 
+    # The include flags are client-side filters: nothing extra goes on the wire.
+    assert fake.calls == [("users.list", {"limit": 50})]
     assert "Showing **4** item(s)" in result
     assert "Hidden" not in result
     assert "| deactivated |" in result
@@ -176,6 +182,7 @@ async def test_list_users_json_returns_the_raw_objects(monkeypatch: pytest.Monke
 
     result = await slack_list_users(ListUsersInput(limit=2, response_format=ResponseFormat.JSON))
 
+    assert fake.calls == [("users.list", {"limit": 2})]
     data = json.loads(result)
     assert data["count"] == 1
     assert data["has_more"] is True
@@ -211,6 +218,7 @@ async def test_list_users_missing_scope_names_users_read(monkeypatch: pytest.Mon
 
     result = await slack_list_users(ListUsersInput())
 
+    assert fake.calls == [("users.list", {"limit": 50})]
     assert result.startswith("Error (missing_scope): Slack refused users.list: missing_scope.")
     assert "User Token Scopes" in result
     assert result.endswith("users.list needs the USER scope `users:read`.")
@@ -264,6 +272,7 @@ async def test_get_user_json_returns_the_raw_user(monkeypatch: pytest.MonkeyPatc
 
     result = await slack_get_user(GetUserInput(user="U0ADA000001", response_format=ResponseFormat.JSON))
 
+    assert fake.calls == [("users.info", {"user": "U0ADA000001"})]
     assert json.loads(result) == ADA
 
 
@@ -279,6 +288,7 @@ async def test_get_user_not_found_renders_the_hint(monkeypatch: pytest.MonkeyPat
 
     result = await slack_get_user(GetUserInput(user="U0NOPE00001"))
 
+    assert fake.calls == [("users.info", {"user": "U0NOPE00001"})]
     assert result == (
         "Error (user_not_found): Slack refused users.info: user_not_found. Unknown user id. Resolve the person with "
         "slack_resolve_user or slack_lookup_user_by_email."
@@ -372,6 +382,10 @@ async def test_resolve_excludes_deleted_and_bots_by_default(monkeypatch: pytest.
 
     result = await slack_resolve_user(ResolveUserInput(query="ricardo"))
 
+    assert fake.calls == [
+        ("users.list", {"limit": 200}),
+        ("users.list", {"limit": 200, "cursor": "cGFnZTI="}),
+    ]
     assert result.startswith('# Slack users matching "ricardo"')
     assert "Searched 3 people. Hidden from the search: 1 deactivated, 2 bots" in result
     assert "| 1.00 | Ricardo Pérez (@Ricardo, U0RIC000001) |  | ricardo@example.com |" in result
@@ -431,6 +445,8 @@ async def test_resolve_by_exact_id_or_email_scores_one(monkeypatch: pytest.Monke
     by_id = await slack_resolve_user(ResolveUserInput(query="U0RIC000001"))
     by_email = await slack_resolve_user(ResolveUserInput(query="ada@example.com"))
 
+    # One walk serves both lookups.
+    assert fake.calls == [("users.list", {"limit": 200})]
     assert "| 1.00 | Ricardo Pérez (@Ricardo, U0RIC000001)" in by_id
     assert "**Unique match**: Ada Lovelace (@ada, U0ADA000001)" in by_email
 
@@ -441,6 +457,7 @@ async def test_resolve_a_one_letter_typo_still_resolves(monkeypatch: pytest.Monk
 
     result = await slack_resolve_user(ResolveUserInput(query="lovlace"))
 
+    assert fake.calls == [("users.list", {"limit": 200})]
     # SequenceMatcher("lovlace", "lovelace").ratio() == 14/15
     assert "| 0.93 | Ada Lovelace (@ada, U0ADA000001) | Analyst | ada@example.com |" in result
     assert "**Unique match**: Ada Lovelace (@ada, U0ADA000001)" in result
@@ -453,6 +470,7 @@ async def test_resolve_a_partial_name_is_listed_without_a_unique_call_out(monkey
 
     result = await slack_resolve_user(ResolveUserInput(query="lovel"))
 
+    assert fake.calls == [("users.list", {"limit": 200})]
     # SequenceMatcher("lovel", "lovelace").ratio() == 10/13
     assert "| 0.77 | Ada Lovelace (@ada, U0ADA000001) |" in result
     assert "**No confident match** (none scores ≥ 0.90) — confirm the person before using any of these ids." in result
@@ -467,9 +485,12 @@ async def test_resolve_with_no_close_match(monkeypatch: pytest.MonkeyPatch) -> N
 
     result = await slack_resolve_user(ResolveUserInput(query="zzzzqqq"))
 
+    assert fake.calls == [("users.list", {"limit": 200})]
     assert "_No one scores ≥ 0.50._" in result
+    assert "`refresh=true` (if they joined after the directory was cached)" in result
     assert "slack_lookup_user_by_email" in result
     assert "| Score |" not in result
+    assert "No confident match" not in result
 
 
 async def test_resolve_respects_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -496,6 +517,8 @@ async def test_resolve_json_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     assert data["hidden_deleted"] == 1
     assert data["hidden_bots"] == 2
     assert data["directory_complete"] is True
+    assert data["directory_stopped"] is None
+    assert data["people_indexed"] == 6
     assert data["matches"][0] == {
         "score": 1.0,
         "id": "U0RIC000001",
@@ -519,36 +542,45 @@ async def test_resolve_refresh_rewalks_the_directory(monkeypatch: pytest.MonkeyP
     assert fake.calls == [("users.list", {"limit": 200}), ("users.list", {"limit": 200})]
 
 
-async def test_resolve_cache_is_keyed_by_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_resolve_cache_is_keyed_by_base_url_and_token(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient({"users.list": _page([ADA])})
     _patch(monkeypatch, fake)
+    token_a = "xoxp-FAKE-aaaaaaaaaaaaaaaa"
+    token_b = "xoxp-FAKE-bbbbbbbbbbbbbbbb"
+    settings = {"value": Settings(slack_user_token=token_a)}
+    monkeypatch.setattr("slack_mcp.tools.users.get_settings", lambda: settings["value"])
 
-    await slack_resolve_user(ResolveUserInput(query="ada"))
-    monkeypatch.setattr(
-        "slack_mcp.tools.users.get_settings", lambda: Settings(slack_api_url="https://other.example.test/api")
-    )
-    await slack_resolve_user(ResolveUserInput(query="ada"))
+    await slack_resolve_user(ResolveUserInput(query="ada"))  # walk 1: slack.com + token A
+    await slack_resolve_user(ResolveUserInput(query="ada"))  # cached
+    settings["value"] = Settings(slack_user_token=token_b)
+    await slack_resolve_user(ResolveUserInput(query="ada"))  # walk 2: another workspace's token
+    settings["value"] = Settings(slack_user_token=token_a, slack_api_url="https://other.example.test/api")
+    await slack_resolve_user(ResolveUserInput(query="ada"))  # walk 3: another base URL
+    settings["value"] = Settings(slack_user_token=token_a)
+    await slack_resolve_user(ResolveUserInput(query="ada"))  # back to the first key: cached
 
-    assert len(fake.calls) == 2
+    assert fake.calls == [("users.list", {"limit": 200})] * 3
+    # The key holds a hash, never the token itself.
+    assert all(token_a not in str(key) and token_b not in str(key) for key in users._DIRECTORY_CACHE)
 
 
-async def test_resolve_an_error_mid_walk_caches_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    failing = _FakeClient(
-        {
-            "users.list": _by_cursor(
-                {
-                    None: _page([ADA], next_cursor="cGFnZTI="),
-                    "cGFnZTI=": SlackApiError("ratelimited", method="users.list"),
-                }
-            )
-        }
-    )
+@pytest.mark.parametrize(
+    "first_page_error",
+    [
+        SlackApiError("ratelimited", method="users.list"),
+        SlackApiError("missing_scope", method="users.list"),
+    ],
+)
+async def test_resolve_an_error_on_the_first_page_caches_nothing(
+    monkeypatch: pytest.MonkeyPatch, first_page_error: SlackApiError
+) -> None:
+    failing = _FakeClient({"users.list": first_page_error})
     _patch(monkeypatch, failing)
 
     error = await slack_resolve_user(ResolveUserInput(query="ada"))
 
-    assert error.startswith("Error (ratelimited): Slack refused users.list: ratelimited.")
-    assert "wait for Retry-After" in error
+    assert failing.calls == [("users.list", {"limit": 200})]
+    assert error.startswith(f"Error ({first_page_error.code}): Slack refused users.list: {first_page_error.code}.")
 
     healthy = _FakeClient({"users.list": _page([ADA])})
     _patch(monkeypatch, healthy)
@@ -558,15 +590,135 @@ async def test_resolve_an_error_mid_walk_caches_nothing(monkeypatch: pytest.Monk
     assert "**Unique match**: Ada Lovelace" in result
 
 
+async def test_resolve_a_non_rate_limit_error_mid_walk_caches_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    failing = _FakeClient(
+        {
+            "users.list": _by_cursor(
+                {None: _page([ADA], next_cursor="cGFnZTI="), "cGFnZTI=": SlackApiError("invalid_cursor")}
+            )
+        }
+    )
+    _patch(monkeypatch, failing)
+
+    error = await slack_resolve_user(ResolveUserInput(query="ada"))
+
+    assert error.startswith("Error (invalid_cursor):")
+    assert users._DIRECTORY_CACHE == {}
+
+
+def _http_429() -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://slack.com/api/users.list")
+    response = httpx.Response(429, headers={"retry-after": "30"}, request=request)
+    return httpx.HTTPStatusError("429 Too Many Requests", request=request, response=response)
+
+
+@pytest.mark.parametrize(
+    "page_two_error",
+    [_http_429(), SlackApiError("ratelimited", method="users.list")],
+    ids=["http-429", "ratelimited-body"],
+)
+async def test_resolve_a_rate_limit_mid_walk_caches_the_pages_read_as_partial(
+    monkeypatch: pytest.MonkeyPatch, page_two_error: Exception
+) -> None:
+    fake = _FakeClient(
+        {"users.list": _by_cursor({None: _page([ADA, RICARDO], next_cursor="cGFnZTI="), "cGFnZTI=": page_two_error})}
+    )
+    _patch(monkeypatch, fake)
+
+    first = await slack_resolve_user(ResolveUserInput(query="ada"))
+    second = await slack_resolve_user(ResolveUserInput(query="ricardo"))
+
+    # The second call is served from the partial cache: page 1 is NOT read again.
+    assert fake.calls == [
+        ("users.list", {"limit": 200}),
+        ("users.list", {"limit": 200, "cursor": "cGFnZTI="}),
+    ]
+    partial = (
+        "The directory index is PARTIAL: Slack rate-limited users.list after 1 page(s), so it holds 2 people — "
+        "pass `refresh=true` in a minute to re-read it"
+    )
+    assert partial in first
+    assert partial in second
+    assert "**Unique match**: Ada Lovelace (@ada, U0ADA000001)" in first
+    assert "**Unique match**: Ricardo Pérez (@Ricardo, U0RIC000001)" in second
+    data = json.loads(await slack_resolve_user(ResolveUserInput(query="ada", response_format=ResponseFormat.JSON)))
+    assert data["directory_complete"] is False
+    assert data["directory_stopped"] == "rate_limited"
+    assert data["people_indexed"] == 2
+    assert len(fake.calls) == 2
+
+
 async def test_resolve_stops_at_the_page_cap_and_says_the_index_is_partial(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("slack_mcp.tools.users.MAX_RESOLVE_PAGES", 2)
-    fake = _FakeClient({"users.list": lambda params: _page([ADA], next_cursor="more")})
+    fake = _FakeClient(
+        {
+            "users.list": _by_cursor(
+                {None: _page([ADA], next_cursor="more"), "more": _page([GRACE, RICARDO], next_cursor="even-more")}
+            )
+        }
+    )
     _patch(monkeypatch, fake)
 
     result = await slack_resolve_user(ResolveUserInput(query="ada"))
 
     assert fake.calls == [("users.list", {"limit": 200}), ("users.list", {"limit": 200, "cursor": "more"})]
-    assert "The directory index is PARTIAL: it stops after 2 pages (400 people)" in result
+    # The people actually read, not pages × 200.
+    assert "The directory index is PARTIAL: it stops after 2 pages and holds 3 people" in result
+
+
+def test_the_page_cap_is_about_one_tier_two_minute() -> None:
+    assert users.MAX_RESOLVE_PAGES == 20
+    assert users.RESOLVE_PAGE_LIMIT == 200
+
+
+async def test_resolve_an_initial_is_not_a_word_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    jr = _user("U0JRS000001", "jrsmith", "J. R. Smith")
+    fake = _FakeClient({"users.list": _page([jr, ADA])})
+    _patch(monkeypatch, fake)
+
+    by_initial = await slack_resolve_user(ResolveUserInput(query="J"))
+    by_surname = await slack_resolve_user(ResolveUserInput(query="smith"))
+
+    assert fake.calls == [("users.list", {"limit": 200})]
+    assert "Unique match" not in by_initial
+    assert "U0JRS000001" not in by_initial
+    assert "_No one scores ≥ 0.50._" in by_initial
+    assert "**Unique match**: J. R. Smith (@jrsmith, U0JRS000001)" in by_surname
+
+
+async def test_resolve_a_one_character_query_is_never_a_unique_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    jay = _user("U0JAY000001", "j", "Jay")
+    fake = _FakeClient({"users.list": _page([jay, ADA])})
+    _patch(monkeypatch, fake)
+
+    result = await slack_resolve_user(ResolveUserInput(query="J"))
+    data = json.loads(await slack_resolve_user(ResolveUserInput(query="J", response_format=ResponseFormat.JSON)))
+
+    assert fake.calls == [("users.list", {"limit": 200})]
+    # The handle "j" matches exactly, but one character is too little to call it unique.
+    assert "| 1.00 | Jay (@j, U0JAY000001) |" in result
+    assert "**Too short for a unique match**: give at least 2 characters" in result
+    assert "Unique match**" not in result
+    assert "<@U0JAY000001>" not in result
+    assert data["unique_match"] is None
+    assert data["confident_matches"] == 1
+
+
+async def test_resolve_concurrent_calls_on_an_empty_cache_walk_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient({"users.list": _by_cursor(DIRECTORY_PAGES)})
+    _patch(monkeypatch, fake)
+
+    first, second = await asyncio.gather(
+        slack_resolve_user(ResolveUserInput(query="Ricardo")),
+        slack_resolve_user(ResolveUserInput(query="Grace")),
+    )
+
+    assert fake.calls == [
+        ("users.list", {"limit": 200}),
+        ("users.list", {"limit": 200, "cursor": "cGFnZTI="}),
+    ]
+    assert "**Unique match**: Ricardo Pérez" in first
+    assert "**Unique match**: Grace Ramírez" in second
 
 
 @pytest.mark.parametrize("query", ["", "   ", "@", " @ "])

@@ -4,19 +4,22 @@ Four read-only tools over `users.list`, `users.info` and `users.lookupByEmail`
 (research 02 §4.9–4.11). `slack_resolve_user` is the bridge every write needs: it turns
 a person's name, handle or display name into the `U…` id that `<@U…>` mentions and
 `slack_open_conversation` take. It walks `users.list` once into a per-process cache
-(keyed by the API base URL) and scores the query with stdlib `difflib` — no extra
-dependency, and no request per lookup after the first.
+(keyed by the API base URL and a hash of the token) and scores the query with stdlib
+`difflib` — no extra dependency, and no request per lookup after the first.
 """
 
 from __future__ import annotations
 
+import asyncio
 import difflib
+import hashlib
 import re
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -40,9 +43,14 @@ MAX_DISPLAY_ROWS = 50
 
 # The resolver reads the directory in pages of this size (the documented ≤ 200 advice).
 RESOLVE_PAGE_LIMIT = 200
-# …and stops after this many pages (10,000 people), saying the index is partial. users.list
-# is Tier 2 (20+/min), so a bigger walk would only trade a slow answer for a rate limit.
-MAX_RESOLVE_PAGES = 50
+# …and stops after this many pages (≈ 4,000 people), saying the index is partial. users.list
+# is Tier 2 (20+ calls per minute), so 20 pages is about one minute of its budget.
+MAX_RESOLVE_PAGES = 20
+
+# A query shorter than this (after normalising) is never called a unique match.
+MIN_UNIQUE_QUERY_LEN = 2
+# Words shorter than this are not scored on their own (initials such as the "J" in "J. R. Smith").
+MIN_WORD_LEN = 2
 
 # Scores at or above this are a confident match; exactly one of them is a "unique match".
 UNIQUE_MATCH_SCORE = 0.9
@@ -68,15 +76,38 @@ class _Directory:
     members: list[dict[str, Any]]
     pages: int
     complete: bool
+    # Why the walk stopped early: "rate_limited" or "page_cap" (None when complete).
+    stopped: str | None = None
 
 
-# Keyed by `Settings.base_url`, so a test server and the real API never share entries.
-_DIRECTORY_CACHE: dict[str, _Directory] = {}
+# Keyed by (base URL, sha256(token)[:12]): a test server and the real API never share an
+# entry, and neither do two tokens (two workspaces) used by the same process.
+_DIRECTORY_CACHE: dict[tuple[str, str], _Directory] = {}
+# Serialises the walk, so concurrent resolver calls on an empty cache read users.list once.
+_DIRECTORY_LOCK = asyncio.Lock()
 
 
 def clear_user_cache() -> None:
-    """Forget the cached directory (tests call this; `refresh=true` does it per call)."""
+    """Forget the cached directory and reset the walk lock (tests call this between event loops).
+
+    `refresh=true` on `slack_resolve_user` re-reads the directory for one key instead.
+    """
+    global _DIRECTORY_LOCK
     _DIRECTORY_CACHE.clear()
+    _DIRECTORY_LOCK = asyncio.Lock()
+
+
+def _cache_key() -> tuple[str, str]:
+    settings = get_settings()
+    token_hash = hashlib.sha256(settings.slack_user_token.encode()).hexdigest()[:12]
+    return settings.base_url, token_hash
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """An HTTP 429 (after the client's one bounded retry) or a `ratelimited` / `rate_limited` body."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429
+    return isinstance(exc, SlackApiError) and exc.code in ("ratelimited", "rate_limited")
 
 
 # --------------------------------------------------------------------------------------
@@ -229,7 +260,11 @@ def _norm(text: Any) -> str:
 
 
 def _candidates(user: Mapping[str, Any]) -> list[str]:
-    """real_name / display_name / name, each whole and split into words (`Ricardo Pérez` → `ricardo`)."""
+    """real_name / display_name / name, each whole and split into words (`Ricardo Pérez` → `ricardo`).
+
+    Single-character words (initials such as the `J` in `J. R. Smith`) are not candidates
+    on their own, so a one-letter query cannot score 1.0 against everyone with that initial.
+    """
     profile = _profile(user)
     names: list[str] = []
     for raw in (
@@ -244,7 +279,7 @@ def _candidates(user: Mapping[str, Any]) -> list[str]:
         if not whole:
             continue
         names.append(whole)
-        names.extend(part for part in _TOKEN_SPLIT_RE.split(whole) if part and part != whole)
+        names.extend(part for part in _TOKEN_SPLIT_RE.split(whole) if len(part) >= MIN_WORD_LEN and part != whole)
     return list(dict.fromkeys(names))
 
 
@@ -264,25 +299,47 @@ def _score(query: str, user: Mapping[str, Any]) -> float:
 
 
 async def _load_directory(refresh: bool) -> _Directory:
-    """The cached directory for this base URL, walking every `users.list` page on a miss."""
-    key = get_settings().base_url
+    """The cached directory for this base URL + token, walking the `users.list` pages on a miss.
+
+    The walk runs under a lock, and the cache is checked again once the lock is held, so
+    concurrent calls on an empty cache read the directory once. A rate limit after at
+    least one page caches what was read as PARTIAL (`stopped="rate_limited"`) instead of
+    failing, so later calls do not restart from page 1 and spend the users.list budget
+    again; `refresh=true` re-reads it. Any other error — or a rate limit on page 1 —
+    raises and caches nothing.
+    """
+    key = _cache_key()
     cached = _DIRECTORY_CACHE.get(key)
     if cached is not None and not refresh:
         return cached
-    client = get_client()
-    members: list[dict[str, Any]] = []
-    cursor: str | None = None
-    pages = 0
-    while True:
-        body = await client.call("users.list", _compact({"limit": RESOLVE_PAGE_LIMIT, "cursor": cursor}))
-        pages += 1
-        members.extend(_members(body))
-        cursor = _next_cursor(body) or None
-        if cursor is None or pages >= MAX_RESOLVE_PAGES:
-            break
-    directory = _Directory(members=members, pages=pages, complete=cursor is None)
-    _DIRECTORY_CACHE[key] = directory
-    return directory
+    async with _DIRECTORY_LOCK:
+        cached = _DIRECTORY_CACHE.get(key)
+        if cached is not None and not refresh:
+            return cached
+        client = get_client()
+        members: list[dict[str, Any]] = []
+        cursor: str | None = None
+        pages = 0
+        stopped: str | None = None
+        while True:
+            try:
+                body = await client.call("users.list", _compact({"limit": RESOLVE_PAGE_LIMIT, "cursor": cursor}))
+            except Exception as exc:
+                if pages == 0 or not _is_rate_limit(exc):
+                    raise
+                stopped = "rate_limited"
+                break
+            pages += 1
+            members.extend(_members(body))
+            cursor = _next_cursor(body) or None
+            if cursor is None:
+                break
+            if pages >= MAX_RESOLVE_PAGES:
+                stopped = "page_cap"
+                break
+        directory = _Directory(members=members, pages=pages, complete=stopped is None, stopped=stopped)
+        _DIRECTORY_CACHE[key] = directory
+        return directory
 
 
 # --------------------------------------------------------------------------------------
@@ -608,12 +665,13 @@ async def slack_lookup_user_by_email(params: LookupUserByEmailInput) -> str:
 async def slack_resolve_user(params: ResolveUserInput) -> str:
     """Turn a name, display name or @handle into Slack user ids, ranked by similarity.
 
-    The first call walks every `users.list` page (200 at a time) into a per-process
-    cache; later calls are answered locally until the server restarts or
-    `refresh=true` is passed. Each person is scored with `difflib.SequenceMatcher`
-    against their real name, display name and handle — whole and word by word, so
-    `Ricardo` matches `Ricardo Pérez` — ignoring case and accents. An exact id or email
-    scores 1.0. Deactivated accounts and bots are excluded by default.
+    The first call walks the `users.list` pages (200 at a time, at most 20 pages) into a
+    per-process cache; later calls are answered locally until the server restarts, and
+    `refresh=true` re-reads the directory. Each person is scored with
+    `difflib.SequenceMatcher` against their real name, display name and handle — whole
+    and word by word (words of 2+ characters, so initials do not count), so `Ricardo`
+    matches `Ricardo Pérez` — ignoring case and accents. An exact id or email scores
+    1.0. Deactivated accounts and bots are excluded by default.
 
     When to Use:
     - Before mentioning someone (`<@U…>`), opening a DM (`slack_open_conversation`) or
@@ -629,9 +687,11 @@ async def slack_resolve_user(params: ResolveUserInput) -> str:
     Returns:
     A ranked markdown table (`Score | User | Title | Email`) of the top `limit` people
     scoring at least 0.50. When exactly ONE person scores ≥ 0.90 it is called out as the
-    unique match with the `<@U…>` string to mention them; several ≥ 0.90 are reported
-    as ambiguous — confirm which one before writing. JSON mode returns the scores and
-    ids plus `unique_match`.
+    unique match with the `<@U…>` string to mention them (never for a query shorter than
+    2 characters); several ≥ 0.90 are reported as ambiguous — confirm which one before
+    writing. A PARTIAL directory (rate limited mid-walk, or past 20 pages) is said so,
+    with the number of people it holds. JSON mode returns the scores and ids plus
+    `unique_match`.
 
     Examples:
     - `params = {"query": "Ricardo"}`
@@ -640,8 +700,10 @@ async def slack_resolve_user(params: ResolveUserInput) -> str:
 
     Error Handling:
     An empty query is rejected locally. `missing_scope` means the app lacks the USER
-    scope `users:read`; `ratelimited` during the first walk means wait for Retry-After
-    and call again (nothing partial is cached on an error).
+    scope `users:read`. A rate limit on the FIRST page is returned as the error (wait for
+    Retry-After and call again; nothing is cached); a rate limit on a later page keeps
+    the pages already read as a PARTIAL directory — pass `refresh=true` after a minute
+    to re-read it whole.
     """
     try:
         directory = await _load_directory(params.refresh)
@@ -653,7 +715,8 @@ async def slack_resolve_user(params: ResolveUserInput) -> str:
         scored.sort(key=lambda pair: (-pair[0], _norm(fmt_user(pair[1])), str(pair[1].get("id") or "")))
         top = scored[: params.limit]
         confident = [member for score, member in scored if score >= UNIQUE_MATCH_SCORE]
-        unique = confident[0] if len(confident) == 1 else None
+        too_short = len(query) < MIN_UNIQUE_QUERY_LEN
+        unique = confident[0] if len(confident) == 1 and not too_short else None
 
         if params.response_format is ResponseFormat.JSON:
             return clip_response(
@@ -664,6 +727,8 @@ async def slack_resolve_user(params: ResolveUserInput) -> str:
                         "hidden_deleted": hidden_deleted,
                         "hidden_bots": hidden_bots,
                         "directory_complete": directory.complete,
+                        "directory_stopped": directory.stopped,
+                        "people_indexed": len(directory.members),
                         "unique_match": unique.get("id") if unique else None,
                         "confident_matches": len(confident),
                         "matches": [
@@ -688,16 +753,27 @@ async def slack_resolve_user(params: ResolveUserInput) -> str:
         searched = f"Searched {len(pool):,} people"
         hidden = _hidden_note(hidden_deleted, hidden_bots, scope="from the search")
         lines.append(searched + "." if not hidden else f"{searched}. {hidden}")
-        if not directory.complete:
+        if directory.stopped == "rate_limited":
             lines.append(
-                f"The directory index is PARTIAL: it stops after {directory.pages} pages "
-                f"({directory.pages * RESOLVE_PAGE_LIMIT:,} people) — use `slack_lookup_user_by_email` if the "
-                "person is missing."
+                f"The directory index is PARTIAL: Slack rate-limited users.list after {directory.pages} page(s), so "
+                f"it holds {len(directory.members):,} people — pass `refresh=true` in a minute to re-read it, or use "
+                "`slack_lookup_user_by_email` if the person is missing."
+            )
+        elif not directory.complete:
+            lines.append(
+                f"The directory index is PARTIAL: it stops after {directory.pages} pages and holds "
+                f"{len(directory.members):,} people — use `slack_lookup_user_by_email` if the person is missing."
             )
         lines.append("")
         if unique is not None:
             uid = str(unique.get("id") or "")
             lines.append(f"**Unique match**: {fmt_user(unique)} — mention as `{render_mention(uid)}`.")
+            lines.append("")
+        elif too_short and top:
+            lines.append(
+                f"**Too short for a unique match**: give at least {MIN_UNIQUE_QUERY_LEN} characters (a name or a "
+                "handle) before using any of these ids."
+            )
             lines.append("")
         elif len(confident) > 1:
             lines.append(
@@ -713,8 +789,8 @@ async def slack_resolve_user(params: ResolveUserInput) -> str:
             lines.append("")
         if not top:
             lines.append(
-                f"_No one scores ≥ {MIN_SCORE:.2f}._ Try another spelling, the email "
-                "(`slack_lookup_user_by_email`), or browse with `slack_list_users`."
+                f"_No one scores ≥ {MIN_SCORE:.2f}._ Try another spelling, `refresh=true` (if they joined after the "
+                "directory was cached), the email (`slack_lookup_user_by_email`), or browse with `slack_list_users`."
             )
             return clip_response("\n".join(lines))
         lines.append("| Score | User | Title | Email |")
