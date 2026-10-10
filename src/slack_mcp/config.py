@@ -80,15 +80,19 @@ class Settings(BaseSettings):
     # member is listed here; `conversations.open` may only open conversations with them.
     slack_write_users: str = ""
 
-    # Optional last line, after a blank line, for every message this server posts, replies,
-    # schedules or edits. Slack does not label messages sent with a user token — they look
-    # exactly like ones you typed — so this is how teammates can tell them apart. Empty =
-    # off. Written in Slack mrkdwn (`<url|label>` links are converted for `format="markdown"`
-    # posts). One line only: a multi-line value is collapsed to a single line (its lines
-    # joined by a space). Recommended (README "Signing your messages"): a mention of the
-    # app's bot user, `<@U0BOTID>`, which Slack renders as the `@<app>` tag in both formats
-    # and which opens the app's profile inside Slack. The app gets that bot user only to be
-    # mentionable — App Manifest `features.bot_user` (`display_name`, `always_online: false`)
+    # Optional signature for every message this server posts, replies, schedules or edits.
+    # Slack does not label messages sent with a user token — they look exactly like ones you
+    # typed — so this is how teammates can tell them apart. Empty = off. When set, the chat
+    # tools send Block Kit `blocks`: the text, then this value in a `context` block (the
+    # small grey font of Slack's own labels; a context text holds at most 3,000 characters),
+    # plus a `text` fallback that ends with it after a blank line. Written in Slack mrkdwn
+    # (in the fallback of a `format="markdown"` message, `<url|label>` links become
+    # `[label](url)`). One line only: a multi-line value is collapsed to a single line (its
+    # lines joined by a space). Recommended (README "Signing your messages"): a bold label,
+    # like the native one, then a mention of the app's bot user, `<@U0BOTID>`, which Slack
+    # renders as the `@<app>` tag and which opens the app's profile inside Slack. The app
+    # gets that bot user only to be mentionable — App Manifest `features.bot_user`
+    # (`display_name`, `always_online: false`)
     # plus one bot scope, `users:read`, then Reinstall to Workspace; its bot token is never
     # used (and is refused). The bot user id: `slack_list_users` with `include_bots=true`.
     # Without a bot user, the fallback is a link to the app's page: `<https://…|@<app>>`.

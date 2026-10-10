@@ -3,9 +3,12 @@
 Every tool here writes with the user token, so Slack shows the message under your own
 name and avatar. Slack does not label these messages: they look exactly like ones you
 typed (measured 2026-10-10 with an internal app, in a self-DM and in a channel).
-To let teammates tell them apart, set `SLACK_SIGNATURE` — `_sign` appends it as the last
-line, after a blank line, of every message these tools post, reply, schedule or edit,
-never twice. The tools
+To let teammates tell them apart, set `SLACK_SIGNATURE`. Every message these tools post,
+reply, schedule or edit then goes out as Block Kit `blocks` — the text, then the
+signature in a `context` block, the small grey font of Slack's own labels — plus a `text`
+fallback (for notifications, search and read-back) that ends with the signature after a
+blank line, never twice (`_sign`, `_build_message`). Without a signature the tools send
+plain `text` / `markdown_text`. The tools
 never gate, never retry and never pick an encoding: `client.call()` runs the write guard
 on the exact parameters that go on the wire (kill-switch, ID-only channel allowlist, DM
 membership, Slack Connect refusal), sends `chat.postMessage` / `chat.update` /
@@ -16,7 +19,8 @@ Two facts from research 02 shape the inputs: `chat.postMessage` truncates `text`
 confirmation renders `fmt_warnings`), and `chat.update` errors with `msg_too_long` past
 4,000 characters (so the update tool refuses that locally). `format="markdown"` sends
 the same string as `markdown_text` — real Markdown, at most 12,000 characters, never
-combined with `text`. Every cap applies to the FINAL text, signature included.
+combined with `text` or `blocks` — or, when signed, as one `markdown` block. Every cap
+applies to the FINAL `text`, signature included.
 """
 
 from __future__ import annotations
@@ -49,6 +53,12 @@ UPDATE_TEXT_MAX = 4_000  # chat.update: msg_too_long past 4,000 characters
 SCHEDULE_MAX_DAYS = 120  # chat.scheduleMessage: "up to 120 days into the future"
 SCHEDULE_MAX_SECONDS = SCHEDULE_MAX_DAYS * 86_400
 
+# Block Kit, for a signed message (docs.slack.dev/reference/block-kit, read 2026-10-10).
+SECTION_TEXT_MAX = 3_000  # section block: "maximum length is 3000 characters" (its text)
+CONTEXT_TEXT_MAX = 3_000  # a context element is a text object: "maximum length is 3000 characters"
+MARKDOWN_BLOCK_MAX = 12_000  # "cumulative limit for all `markdown` blocks in a single payload is 12,000"
+MESSAGE_BLOCKS_MAX = 50  # "You can include up to 50 blocks in each message"
+
 # Slack codes whose errors.py hint is the "outcome UNKNOWN — read back before retrying"
 # wording for writes; a failed permalink lookup under "SENT" renders them by code only.
 _UNKNOWN_OUTCOME_CODES = frozenset(
@@ -62,7 +72,8 @@ _CHANNEL_DESCRIPTION = (
 _FORMAT_DESCRIPTION = (
     "How Slack reads `text`. 'mrkdwn' (default) = Slack's own syntax: *bold* (single asterisks), _italic_, "
     "~strike~, `code`, <@U0123ABCDEF> mentions, <https://example.com|label> links, no headers. 'markdown' = real "
-    "Markdown (**bold**, # headings, [label](url)), sent as markdown_text, at most 12,000 characters."
+    "Markdown (**bold**, # headings, [label](url)), sent as markdown_text (as one markdown block when "
+    "SLACK_SIGNATURE is set), at most 12,000 characters."
 )
 _UNFURL_LINKS_DESCRIPTION = "Let Slack expand link previews in the message (default false)."
 _UNFURL_MEDIA_DESCRIPTION = "Let Slack expand image/video previews in the message (default false)."
@@ -140,27 +151,46 @@ def _is_signature_line(line: str, signature: str) -> bool:
     return candidate in {_comparable(signature), _comparable(_signature_for("markdown", signature))}
 
 
+def _unsigned(text: str, signature: str) -> tuple[str, bool]:
+    """`(text without its trailing signature lines, had one?)`.
+
+    "Trailing signature line" means the LAST line, trailing whitespace ignored, is the
+    signature in either form (`_is_signature_line`, entities decoded); it is cut together
+    with the blank lines before it, and again while the new last line is one too — so a
+    text that somehow ends with the signature twice comes back with none. Otherwise the
+    text comes back right-trimmed. A signature quoted in the middle of the text is not a
+    trailing line and stays.
+    """
+    body = text.rstrip()
+    had_signature = False
+    while body:
+        head, _, last = body.rpartition("\n")
+        if not _is_signature_line(last, signature):
+            break
+        body, had_signature = head.rstrip(), True
+    return body, had_signature
+
+
 def _sign(text: str, settings: Settings, fmt: MessageFormat = "mrkdwn") -> tuple[str, bool]:
     """`(text to send, appended?)` — the text plus the signature line, unless it already ends with it.
 
     Appends `"\\n\\n" + signature` — after a blank line — in both formats. "Already ends
     with it" means the LAST line, trailing whitespace ignored, is the signature in either
-    form (`_is_signature_line`, entities decoded), whatever number of blank lines precedes
-    it: that line is then rewritten as the signature for `fmt`, behind exactly one blank
-    line, so an edit of a signed message — even from Slack's read-back text, or in the
-    other format — keeps exactly one signature, always standing apart from the text (and
-    in markdown never inside the list item, quote or table row above it). A signature
-    quoted in the middle of the text does not count: the text is signed again at the end.
-    No signature configured → the text unchanged.
+    form (`_unsigned`), whatever number of blank lines precedes it: that line is then
+    rewritten as the signature for `fmt`, behind exactly one blank line, so an edit of a
+    signed message — even from Slack's read-back text, or in the other format — keeps
+    exactly one signature, always standing apart from the text (and in markdown never
+    inside the list item, quote or table row above it). A signature quoted in the middle
+    of the text does not count: the text is signed again at the end. No signature
+    configured → the text unchanged. This is the `text` that goes on the wire (the
+    fallback, when `_build_message` adds the blocks).
     """
     if settings.signature is None:
         return text, False
     signature = _signature_for(fmt, settings.signature)
-    body = text.rstrip()
-    head, _, last = body.rpartition("\n")
-    if _is_signature_line(last, settings.signature):
-        head = head.rstrip()
-        return (f"{head}{_SIGNATURE_SEPARATOR}{signature}" if head else signature), False
+    body, had_signature = _unsigned(text, settings.signature)
+    if had_signature:
+        return (f"{body}{_SIGNATURE_SEPARATOR}{signature}" if body else signature), False
     return f"{body}{_SIGNATURE_SEPARATOR}{signature}", True
 
 
@@ -168,11 +198,130 @@ class SignedTextTooLongError(RuntimeError):
     """The text plus its signature exceeds the cap for the method / format; nothing is sent."""
 
 
-def _prepare_text(text: str, fmt: MessageFormat, limit: int, why: str) -> tuple[str, str]:
-    """`(final text, confirmation line)`: sign the text, then check `limit` on the FINAL text.
+class BlockLimitError(RuntimeError):
+    """The signed message does not fit Slack's Block Kit limits; nothing is sent."""
 
-    The input models already cap the text as typed; this catches the case where the
-    signature pushes it over. Raised before any Slack call, so nothing goes out.
+
+def _line_cut(line: str, size: int) -> tuple[int, int]:
+    """`(end, skip)` to split a line longer than `size`: `line[:end]`, then `line[end + skip:]`.
+
+    Backs off to the last space or tab in the second half of the window (dropped, like the
+    newline at a line cut; the first half is not searched, so a short spaced prefix before
+    a long unbroken run does not become a tiny section), and never cuts between an
+    unclosed `<` and its `>` — a `<@U…>` mention or a `<url|label>` link stays whole,
+    moving to the next piece. Only when no such point exists (one word, or one entity,
+    longer than that) is the line hard-cut at `size`.
+    """
+    end, skip = size, 0
+    floor = max(1, size // 2)
+    space = max(line.rfind(" ", floor, size + 1), line.rfind("\t", floor, size + 1))
+    if space > 0:
+        end, skip = space, 1
+    opening = line.rfind("<", 0, end)
+    if opening > line.rfind(">", 0, end):
+        kept = len(line[:opening].rstrip(" \t"))  # cut before the entity, and before the spaces in front of it
+        return (kept, opening - kept) if kept > 0 else (size, 0)
+    return end, skip
+
+
+def _trim_blank_edges(piece: str) -> str:
+    """`piece` without its leading and trailing whitespace-only lines."""
+    lines = piece.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _section_chunks(body: str, size: int = SECTION_TEXT_MAX) -> list[str]:
+    """`body` cut at line boundaries into pieces of at most `size` characters, in order.
+
+    Lines are packed greedily; a single line longer than `size` is split by `_line_cut`
+    (at a space, never inside a `<…>` entity, hard only as a last resort). The newline at
+    a cut is dropped (each piece is its own section block), as are whitespace-only lines
+    at a piece's edges and pieces with nothing but whitespace — a section's text must
+    hold at least one character.
+    """
+    pieces: list[str] = []
+    current: str | None = None
+    for raw_line in body.split("\n"):
+        line = raw_line
+        while len(line) > size:
+            if current is not None:
+                pieces.append(current)
+                current = None
+            end, skip = _line_cut(line, size)
+            pieces.append(line[:end])
+            line = line[end + skip :]
+        if current is None:
+            current = line
+        elif len(current) + 1 + len(line) <= size:
+            current = f"{current}\n{line}"
+        else:
+            pieces.append(current)
+            current = line
+    if current is not None:
+        pieces.append(current)
+    trimmed = (_trim_blank_edges(piece) for piece in pieces)
+    return [piece for piece in trimmed if piece]
+
+
+def _build_message(text: str, fmt: MessageFormat, settings: Settings) -> dict[str, Any]:
+    """The message fields of the wire params for the FINAL `text` (as `_sign` returned it).
+
+    No signature configured → `{"text": …}` or `{"markdown_text": …}`, exactly as before.
+    With one → `{"text": text, "blocks": [...]}`: the text minus its trailing signature line
+    (`_unsigned`, so the signature is never inside a body block) as one or more `section`
+    blocks of mrkdwn (≤ 3,000 characters each, cut at line boundaries) — or, for
+    `format="markdown"`, as ONE `markdown` block (≤ 12,000) with no `markdown_text`, which
+    Slack refuses next to `blocks` — then a `context` block holding the signature as
+    mrkdwn (the form `SLACK_SIGNATURE` is written in). `text` stays the whole signed text:
+    Slack shows it in notifications and search and returns it on read-back.
+
+    Raises `BlockLimitError` before any call when the signature is longer than a context
+    text may be (3,000) or the body needs more than 49 blocks (50 per message, the
+    context block included).
+    """
+    signature = settings.signature
+    if signature is None:
+        return _text_field(fmt, text)
+    if len(signature) > CONTEXT_TEXT_MAX:
+        raise BlockLimitError(
+            f"SLACK_SIGNATURE is {len(signature):,} characters, but it is sent as the text of a Block Kit context "
+            f"block, which Slack limits to {CONTEXT_TEXT_MAX:,} characters — shorten SLACK_SIGNATURE. Nothing was sent."
+        )
+    body, _ = _unsigned(text, signature)
+    body_blocks: list[dict[str, Any]]
+    if fmt == "markdown":
+        if len(body) > MARKDOWN_BLOCK_MAX:
+            raise BlockLimitError(
+                f"text is {len(body):,} characters, but format='markdown' sends it as a markdown block, which Slack "
+                f"limits to {MARKDOWN_BLOCK_MAX:,} characters — shorten it or split it into several messages. Nothing "
+                "was sent."
+            )
+        body_blocks = [{"type": "markdown", "text": body}] if body else []
+    else:
+        body_blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": chunk}} for chunk in _section_chunks(body)
+        ]
+    if len(body_blocks) + 1 > MESSAGE_BLOCKS_MAX:
+        raise BlockLimitError(
+            f"the text needs {len(body_blocks)} section blocks of at most {SECTION_TEXT_MAX:,} characters, plus the "
+            f"signature's context block; Slack allows at most {MESSAGE_BLOCKS_MAX} blocks per message — shorten the "
+            "text or split it into several messages. Nothing was sent."
+        )
+    context = {"type": "context", "elements": [{"type": "mrkdwn", "text": signature}]}
+    return {"text": text, "blocks": [*body_blocks, context]}
+
+
+def _prepare_message(text: str, fmt: MessageFormat, limit: int, why: str) -> tuple[dict[str, Any], str]:
+    """`(message fields for the wire params, confirmation line)`.
+
+    Signs the text, checks `limit` on the FINAL text, then builds the fields with
+    `_build_message`. The input models already cap the text as typed; this catches the
+    case where the signature pushes it over. Raised before any Slack call, so nothing
+    goes out.
     """
     settings = get_settings()
     final, appended = _sign(text, settings, fmt)
@@ -186,13 +335,14 @@ def _prepare_text(text: str, fmt: MessageFormat, limit: int, why: str) -> tuple[
             f"text is {len(final):,} characters{included}; the limit is {limit:,}{why} — shorten the text by at "
             f"least {over:,} character{'' if over == 1 else 's'}. Nothing was sent."
         )
+    fields = _build_message(final, fmt, settings)
     if appended:
-        line = "- **signature**: appended"
+        line = "- **signature**: appended (context block)"
     elif settings.signature is not None:
-        line = "- **signature**: already the last line of the text — not added again"
+        line = "- **signature**: already the last line of the text — not added again (context block)"
     else:
         line = "- **signature**: not configured"
-    return final, line
+    return fields, line
 
 
 def _post_limit(fmt: MessageFormat) -> tuple[int, str]:
@@ -217,8 +367,8 @@ class PostMessageInput(BaseModel):
         max_length=POST_TEXT_MAX,
         description=(
             "The message, sent verbatim. Keep it under ~4,000 characters for readability; Slack truncates past "
-            "40,000 (and at most 12,000 with format='markdown'). If SLACK_SIGNATURE is set it is appended as the last "
-            "line and counts toward these limits."
+            "40,000 (and at most 12,000 with format='markdown'). If SLACK_SIGNATURE is set it is shown under the text "
+            "(a context block) and appended as the last line of the text fallback, and counts toward these limits."
         ),
     )
     format: MessageFormat = Field(default="mrkdwn", description=_FORMAT_DESCRIPTION)
@@ -267,7 +417,8 @@ class ReplyInThreadInput(BaseModel):
         max_length=POST_TEXT_MAX,
         description=(
             "The reply, sent verbatim (Slack truncates past 40,000; at most 12,000 with format='markdown'). If "
-            "SLACK_SIGNATURE is set it is appended as the last line and counts toward these limits."
+            "SLACK_SIGNATURE is set it is shown under the text (a context block) and appended as the last line of the "
+            "text fallback, and counts toward these limits."
         ),
     )
     format: MessageFormat = Field(default="mrkdwn", description=_FORMAT_DESCRIPTION)
@@ -309,8 +460,8 @@ class UpdateMessageInput(BaseModel):
         max_length=UPDATE_TEXT_MAX,
         description=(
             "The new text, replacing the old one entirely. At most 4,000 characters (chat.update's limit). If "
-            "SLACK_SIGNATURE is set it stays the last line (appended unless this text already ends with it) and "
-            "counts toward the limit."
+            "SLACK_SIGNATURE is set it stays under the text (a context block) and the last line of the text fallback "
+            "(appended unless this text already ends with it), and counts toward the limit."
         ),
     )
     format: MessageFormat = Field(default="mrkdwn", description=_FORMAT_DESCRIPTION)
@@ -345,7 +496,8 @@ class ScheduleMessageInput(BaseModel):
         max_length=POST_TEXT_MAX,
         description=(
             "The message, sent verbatim (at most 12,000 characters with format='markdown'). If SLACK_SIGNATURE is "
-            "set it is appended as the last line and counts toward the limits."
+            "set it is shown under the text (a context block) and appended as the last line of the text fallback, "
+            "and counts toward the limits."
         ),
     )
     format: MessageFormat = Field(default="mrkdwn", description=_FORMAT_DESCRIPTION)
@@ -471,14 +623,18 @@ async def slack_post_message(params: PostMessageInput) -> str:
     Calls `chat.postMessage` once with your user token, so the message shows your name
     and avatar — there is no bot identity. Slack does not label these messages: they look
     exactly like ones you typed. To let teammates tell them apart, set `SLACK_SIGNATURE` —
-    the server appends it as the last line, after a blank line, of every message it posts
-    (not again if the text already ends with it; it counts toward the length limits below).
-    The text goes out verbatim. With `format="mrkdwn"` (default) it is sent as `text` in
+    the message then goes out as Block Kit `blocks`: the text, then the signature in a
+    `context` block (the small grey font of Slack's own labels), plus a `text` fallback for
+    notifications and search that ends with the signature after a blank line (not again if
+    the text already ends with it; it counts toward the length limits below). Without a
+    signature the tool sends plain `text` / `markdown_text`. The text goes out verbatim. With `format="mrkdwn"` (default) it is sent as `text` in
     Slack's own syntax: `*bold*` (single asterisks), `_italic_`, `` `code` ``,
     `<@U0123ABCDEF>` to mention someone (an id, never a name), `<https://x.y|label>` for a
-    link, and no headers. With `format="markdown"` the same string is sent as
-    `markdown_text` (real Markdown, at most 12,000 characters) instead of `text`. After a
-    successful post the tool looks up the message permalink with `chat.getPermalink`.
+    link, and no headers (signed: in `section` blocks of at most 3,000 characters, cut at
+    line boundaries). With `format="markdown"` the same string is sent as `markdown_text`
+    (real Markdown, at most 12,000 characters) instead of `text` — signed, as one
+    `markdown` block and no `markdown_text`. After a successful post the tool looks up the
+    message permalink with `chat.getPermalink`.
 
     Refused unless `SLACK_ALLOW_WRITES=1` AND the target is allowed by
     `SLACK_WRITE_CHANNELS` / `SLACK_WRITE_USERS` (Slack Connect channels only by explicit
@@ -518,14 +674,17 @@ async def slack_post_message(params: PostMessageInput) -> str:
       user scope).
     - `Error: text is N characters including the …-character signature …`: the signature pushed the
       text over the limit; nothing was sent — shorten the text.
+    - `Error: … Slack allows at most 50 blocks per message …` / `Error: SLACK_SIGNATURE is N characters …
+      context block …`: the signed message does not fit Block Kit's limits; nothing was sent.
+      `invalid_blocks` / `msg_blocks_too_long` are Slack refusing the blocks.
     - A timeout or 5xx means the execution status is UNKNOWN: read the conversation back with
       `slack_get_history` before posting again.
     """
     try:
-        text, signature_line = _prepare_text(params.text, params.format, *_post_limit(params.format))
+        message, signature_line = _prepare_message(params.text, params.format, *_post_limit(params.format))
         wire: dict[str, Any] = {
             "channel": params.channel,
-            **_text_field(params.format, text),
+            **message,
             "unfurl_links": params.unfurl_links,
             "unfurl_media": params.unfurl_media,
         }
@@ -552,12 +711,14 @@ async def slack_reply_in_thread(params: ReplyInThreadInput) -> str:
     Calls `chat.postMessage` once with `thread_ts` set to the thread's PARENT message, so
     the reply lands in that thread under your name and avatar. Slack does not label these
     messages: they look exactly like ones you typed. To let teammates tell them apart, set
-    `SLACK_SIGNATURE` — the server appends it as the last line of every message it posts
-    (not again if the text already ends with it; it counts toward the length limits).
+    `SLACK_SIGNATURE` — the reply then shows it under the text in a `context` block, and
+    the `text` fallback ends with it (not again if the text already ends with it; it counts
+    toward the length limits).
     `reply_broadcast=true` also shows it in the channel. Text and
     `format` work exactly as in `slack_post_message` (`mrkdwn` → `text` with `*bold*`,
     `<@U…>` mentions and `<url|label>` links; `markdown` → `markdown_text`, ≤ 12,000
-    characters). After a successful post the permalink is looked up with `chat.getPermalink`.
+    characters; signed, both go out as `blocks` + `text`). After a successful post the
+    permalink is looked up with `chat.getPermalink`.
 
     Refused unless `SLACK_ALLOW_WRITES=1` AND the target is allowed by
     `SLACK_WRITE_CHANNELS` / `SLACK_WRITE_USERS` (Slack Connect channels only by explicit
@@ -594,15 +755,18 @@ async def slack_reply_in_thread(params: ReplyInThreadInput) -> str:
       `missing_scope` (needs the `chat:write` user scope).
     - `Error: text is N characters including the …-character signature …`: the signature pushed the
       text over the limit; nothing was sent — shorten the text.
+    - `Error: … Slack allows at most 50 blocks per message …` / `Error: SLACK_SIGNATURE is N characters …
+      context block …`: the signed reply does not fit Block Kit's limits; nothing was sent.
+      `invalid_blocks` / `msg_blocks_too_long` are Slack refusing the blocks.
     - A timeout or 5xx means the execution status is UNKNOWN: read the thread back with
       `slack_get_thread` before replying again.
     """
     try:
-        text, signature_line = _prepare_text(params.text, params.format, *_post_limit(params.format))
+        message, signature_line = _prepare_message(params.text, params.format, *_post_limit(params.format))
         wire: dict[str, Any] = {
             "channel": params.channel,
             "thread_ts": params.thread_ts,
-            **_text_field(params.format, text),
+            **message,
             "reply_broadcast": params.reply_broadcast,
             "unfurl_links": params.unfurl_links,
             "unfurl_media": params.unfurl_media,
@@ -625,16 +789,23 @@ async def slack_reply_in_thread(params: ReplyInThreadInput) -> str:
 async def slack_update_message(params: UpdateMessageInput) -> str:
     """Edit one of your own Slack messages as you — a SLACK_SIGNATURE line, if set, stays exactly once.
 
-    Calls `chat.update` once with your user token: the new `text` replaces the old text
-    entirely (and removes any blocks the message had). Only messages you posted can be
+    Calls `chat.update` once with your user token: the new text replaces the old text
+    entirely. Slack documents that an edit sending `text` without `blocks` removes the
+    blocks the message had (so a signed message edited with SLACK_SIGNATURE unset loses
+    its context block); what a `markdown_text`-only edit does to a message with blocks is
+    not measured. Only messages you posted can be
     edited — Slack refuses anyone else's with `cant_update_message`. The message stays
     posted as you. Slack does not label these messages: they look exactly like ones you
     typed. To let teammates tell them apart, set `SLACK_SIGNATURE` — the server keeps it
     as the last line of the edited text: appended unless the new text already ends with
     it (in either format's form, or as Slack stored it, e.g. `&amp;`), so an edit of a
     signed message — the text read back with `slack_get_thread` / `slack_get_history`,
-    changed — stays signed exactly once. `format` works as in
-    `slack_post_message` (`mrkdwn` → `text`, `markdown` → `markdown_text`). The text
+    changed — stays signed exactly once. With a signature the edit always resends the
+    `blocks` too (the text without its signature line, then the signature's `context`
+    block), replacing the old ones; Slack does not show its "edited" mark on an edit made
+    with blocks. `format` works as in `slack_post_message`: unsigned, `mrkdwn` → `text`
+    and `markdown` → `markdown_text`; signed, both send `text` + `blocks` (sections, or one
+    `markdown` block). The text
     (signature included) is capped at 4,000 characters locally because `chat.update`
     refuses longer text with `msg_too_long` (unlike `chat.postMessage`, which accepts up
     to 40,000).
@@ -657,7 +828,8 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
     Returns:
     A confirmation echoing only what Slack returned: `channel`, `ts`, the stored `text`,
     and any Slack warning — plus a `signature` line (appended / already the last line /
-    not configured) — or an `Error ...` string.
+    not configured) and, for an edit sent with blocks, a note that Slack hides its
+    "edited" mark on it — or an `Error ...` string.
 
     Examples:
     - `params = {"channel": "C0123ABCDEF", "ts": "1712345678.123456", "text": "Deploy done (v2) :rocket:"}`
@@ -669,13 +841,15 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
       edit window passed; `message_not_found`: check channel AND ts; `msg_too_long`: over 4,000
       characters; `missing_scope`: needs the `chat:write` user scope.
     - `Error: text is N characters including the …-character signature …`: the signature pushed the
-      text over 4,000; nothing was sent — shorten the text.
+      text over 4,000; nothing was sent — shorten the text. `Error: SLACK_SIGNATURE is N characters
+      … context block …`: the signature itself is too long for a context block; nothing was sent.
+      `invalid_blocks` / `msg_blocks_too_long` are Slack refusing the blocks.
     """
     try:
-        text_out, signature_line = _prepare_text(
+        message, signature_line = _prepare_message(
             params.text, params.format, UPDATE_TEXT_MAX, " (chat.update refuses longer text with msg_too_long)"
         )
-        wire: dict[str, Any] = {"channel": params.channel, "ts": params.ts, **_text_field(params.format, text_out)}
+        wire: dict[str, Any] = {"channel": params.channel, "ts": params.ts, **message}
         body = await get_client().call("chat.update", wire)
         text = body.get("text")
         lines = [
@@ -688,6 +862,11 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
             f"- **text** (as Slack stored it):\n{text}" if text else "- **text**: Slack returned none",
             signature_line,
         ]
+        if "blocks" in wire:
+            lines.append(
+                '- **note**: sent with Block Kit blocks — Slack does not show its "(edited)" mark on an edit made '
+                "with blocks"
+            )
         warnings = fmt_warnings(body)
         if warnings:
             lines.append(warnings)
@@ -712,8 +891,9 @@ async def slack_schedule_message(params: ScheduleMessageInput) -> str:
     Calls `chat.scheduleMessage` once with your user token. At `post_at` Slack posts the
     message under your name and avatar. Slack does not label these messages: they look
     exactly like ones you typed. To let teammates tell them apart, set `SLACK_SIGNATURE` —
-    the server appends it as the last line of every message it schedules (not again if the
-    text already ends with it; it counts toward the length limits). `post_at` is ISO-8601
+    the scheduled message then carries `blocks` with the signature in a `context` block
+    under the text, and the `text` fallback ends with it (not again if the text already
+    ends with it; it counts toward the length limits). `post_at` is ISO-8601
     (no offset = UTC) or epoch seconds, converted to epoch seconds; it must be in the
     future and at most 120 days ahead (checked locally — Slack's limit).
     Slack also refuses more than 30 scheduled messages within any 5-minute window in the
@@ -751,15 +931,16 @@ async def slack_schedule_message(params: ScheduleMessageInput) -> str:
       channel per 5 minutes); `not_in_channel` (join in Slack first); `channel_not_found`; `is_archived`;
       `msg_too_long`; `missing_scope` (needs the `chat:write` user scope).
     - `Error: text is N characters including the …-character signature …`: the signature pushed the
-      text over the limit; nothing was scheduled — shorten the text.
+      text over the limit; nothing was scheduled — shorten the text. A Block Kit limit (`Error: …
+      50 blocks …`, `… context block …`) also stops it before anything is scheduled.
     - A timeout or 5xx means the execution status is UNKNOWN — do not schedule it again blindly.
     """
     try:
-        text, signature_line = _prepare_text(params.text, params.format, *_post_limit(params.format))
+        message, signature_line = _prepare_message(params.text, params.format, *_post_limit(params.format))
         wire: dict[str, Any] = {
             "channel": params.channel,
             "post_at": int(params.post_at),
-            **_text_field(params.format, text),
+            **message,
             "unfurl_links": params.unfurl_links,
             "unfurl_media": params.unfurl_media,
         }
