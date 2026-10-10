@@ -23,7 +23,7 @@ from pydantic import ValidationError
 from slack_mcp.client import SlackClient
 from slack_mcp.config import Settings, get_settings
 from slack_mcp.errors import SlackApiError
-from slack_mcp.formatters import ts_to_human
+from slack_mcp.formatters import MESSAGE_CONTINUATION, render_message, ts_to_human
 from slack_mcp.guard import WriteNotAllowedError, WritesDisabledError
 from slack_mcp.tools.chat import (
     MARKDOWN_TEXT_MAX,
@@ -758,8 +758,8 @@ APP_URL = "https://masavaco.slack.com/marketplace/A0C835DFNSH"
 SIG = f"Sent using <{APP_URL}|@Alejandro AI>"  # what SLACK_SIGNATURE holds (mrkdwn)
 SIG_MD = f"Sent using [@Alejandro AI]({APP_URL})"  # the same line for markdown_text
 SIGNATURES = {"mrkdwn": SIG, "markdown": SIG_MD}
-# mrkdwn: one newline. markdown: a blank line, so the signature is its own paragraph.
-SEP = {"mrkdwn": "\n", "markdown": "\n\n"}
+# Both formats: a blank line, so the signature stands apart (and, in markdown, is its own paragraph).
+SEP = {"mrkdwn": "\n\n", "markdown": "\n\n"}
 TEXT_KEY = {"mrkdwn": "text", "markdown": "markdown_text"}
 
 
@@ -771,8 +771,8 @@ def _sign_with(monkeypatch: pytest.MonkeyPatch, value: str = SIG) -> None:
     monkeypatch.setattr("slack_mcp.tools.chat.get_settings", lambda: Settings(slack_signature=value))
 
 
-def test_sign_appends_the_signature_as_a_new_last_line() -> None:
-    assert _sign("Deploy done", Settings(slack_signature=SIG)) == (f"Deploy done\n{SIG}", True)
+def test_sign_appends_the_signature_after_a_blank_line() -> None:
+    assert _sign("Deploy done", Settings(slack_signature=SIG)) == (f"Deploy done\n\n{SIG}", True)
     assert _sign("Deploy done", Settings(slack_signature=SIG), "markdown") == (f"Deploy done\n\n{SIG_MD}", True)
 
 
@@ -782,8 +782,8 @@ def test_markdown_signature_cannot_be_pulled_into_a_list_quote_or_table() -> Non
         signed, appended = _sign(block, settings, "markdown")
         assert appended is True
         assert signed == f"{block}\n\n{SIG_MD}"  # a blank line ends the list / quote / table
-    # mrkdwn has no such blocks: a newline is a line break, no blank line added.
-    assert _sign("- one\n- two", settings) == (f"- one\n- two\n{SIG}", True)
+    # mrkdwn has no such blocks, but the blank line is there too: it keeps the signature visibly apart.
+    assert _sign("- one\n- two", settings) == (f"- one\n- two\n\n{SIG}", True)
 
 
 def test_sign_without_a_signature_returns_the_text_unchanged() -> None:
@@ -808,9 +808,9 @@ def test_sign_is_idempotent_on_an_already_signed_text(fmt: Any) -> None:
 def test_sign_re_signs_when_the_signature_is_not_the_last_line() -> None:
     settings = Settings(slack_signature=SIG)
     middle = f"Quoting it:\n{SIG}\nand more after"
-    assert _sign(middle, settings) == (f"{middle}\n{SIG}", True)
+    assert _sign(middle, settings) == (f"{middle}\n\n{SIG}", True)
     same_line = f"Deploy done {SIG}"  # ends with it, but not as its own line
-    assert _sign(same_line, settings) == (f"{same_line}\n{SIG}", True)
+    assert _sign(same_line, settings) == (f"{same_line}\n\n{SIG}", True)
     assert _sign(f"x\n\n{SIG_MD}\n\nmore", settings, "markdown") == (f"x\n\n{SIG_MD}\n\nmore\n\n{SIG_MD}", True)
 
 
@@ -852,12 +852,15 @@ def test_trailing_whitespace_after_the_signature_does_not_re_sign(fmt: Any) -> N
 
 
 @pytest.mark.parametrize("block", ["## Plan\n- **one**\n- two", "> a quoted line", "| a | b |\n|---|---|\n| 1 | 2 |"])
-def test_markdown_moves_an_existing_signature_out_of_a_list_quote_or_table(block: str) -> None:
-    """A signature right under a block (single newline) would render inside it: it gets its blank line."""
+def test_an_existing_signature_right_under_the_text_is_moved_behind_a_blank_line(block: str) -> None:
+    """A signature right under the text (single newline) gets its blank line, in both formats.
+
+    In markdown it would otherwise render inside the list / quote / table; in mrkdwn it would
+    read as glued to the last line (the separator before t15 — such texts are still around).
+    """
     settings = Settings(slack_signature=SIG)
     assert _sign(f"{block}\n{SIG_MD}", settings, "markdown") == (f"{block}\n\n{SIG_MD}", False)
-    # mrkdwn has no such blocks: the single newline stays.
-    assert _sign(f"{block}\n{SIG}", settings) == (f"{block}\n{SIG}", False)
+    assert _sign(f"{block}\n{SIG}", settings) == (f"{block}\n\n{SIG}", False)
 
 
 def test_signature_links_are_converted_only_for_markdown() -> None:
@@ -869,6 +872,37 @@ def test_signature_links_are_converted_only_for_markdown() -> None:
     # A bare <url> is already a Markdown autolink; mentions, channel links and specials are not URLs.
     untouched = "— <https://a.example> <@U0ANA000001> <#C0123ABCDEF|general> <!here>"
     assert _signature_for("markdown", untouched) == untouched
+
+
+# The recommended value (t15): a mention of the app's bot user, which Slack renders as the
+# `@Alejandro AI` tag and opens the app's profile inside Slack (a URL opens the web).
+BOT_USER_ID = "U0BOT000001"
+MENTION_SIG = f"Sent using <@{BOT_USER_ID}>"
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+def test_a_bot_user_mention_signature_is_the_same_line_in_both_formats(fmt: Any) -> None:
+    settings = Settings(slack_signature=MENTION_SIG)
+    assert _signature_for(fmt, MENTION_SIG) == MENTION_SIG  # `<@U…>` is a mention in markdown_text too
+    signed, appended = _sign("Deploy done", settings, fmt)
+    assert (signed, appended) == (f"Deploy done\n\n{MENTION_SIG}", True)
+    assert _sign(signed, settings, fmt) == (signed, False)  # never twice
+    for gap in ("\n", "\n\n\n"):  # rebuilt behind exactly one blank line
+        assert _sign(f"Deploy done{gap}{MENTION_SIG}", settings, fmt) == (signed, False), repr(gap)
+
+
+def test_a_signed_message_reads_back_as_a_blank_continuation_then_the_signature() -> None:
+    """The shape test_live_write's step 9 expects from slack_get_thread, pinned offline.
+
+    render_message prefixes every line after the first with `  │ ` and strips the blank
+    line's trailing space, so the blank line reads `  │` and the signature line carries the
+    `(ts …)` suffix.
+    """
+    signed, _ = _sign("Deploy done", Settings(slack_signature=MENTION_SIG))
+    rendered = render_message({"user": "U0ME0000001", "text": signed, "ts": TS})
+    blank = MESSAGE_CONTINUATION.rstrip()
+    assert blank == "  │"
+    assert rendered.endswith(f": Deploy done\n{blank}\n{MESSAGE_CONTINUATION}{MENTION_SIG} (ts {TS})"), rendered
 
 
 @pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
@@ -890,6 +924,17 @@ async def test_post_sends_the_signed_text(monkeypatch: pytest.MonkeyPatch, fmt: 
     )
     assert "- **signature**: appended" in result
     assert result.startswith("# Message sent")
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+async def test_post_sends_a_mention_signature_verbatim(monkeypatch: pytest.MonkeyPatch, fmt: Any) -> None:
+    _sign_with(monkeypatch, MENTION_SIG)
+    fake = _FakeClient(routes={"chat.postMessage": _posted(), "chat.getPermalink": PERMALINK_OK})
+    _patch(monkeypatch, fake)
+
+    await slack_post_message(PostMessageInput(channel=CHANNEL, text="- one\n- two", format=fmt))
+
+    assert fake.calls[0][1][TEXT_KEY[fmt]] == f"- one\n- two\n\n{MENTION_SIG}"
 
 
 @pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
@@ -1040,7 +1085,7 @@ async def test_update_cap_counts_the_signature(monkeypatch: pytest.MonkeyPatch) 
     _sign_with(monkeypatch)
     fake = _FakeClient(routes={"chat.update": {"ok": True, "channel": CHANNEL, "ts": TS}})
     _patch(monkeypatch, fake)
-    room = UPDATE_TEXT_MAX - len(SIG) - 1  # the text that exactly fits with "\n" + signature
+    room = UPDATE_TEXT_MAX - len(SIG) - 2  # the text that exactly fits with "\n\n" + signature
 
     fits = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text="x" * room))
     assert fits.startswith("# Message updated")
@@ -1080,12 +1125,27 @@ async def test_an_already_signed_text_at_the_cap_is_accepted(monkeypatch: pytest
     _sign_with(monkeypatch)
     fake = _FakeClient(routes={"chat.update": {"ok": True, "channel": CHANNEL, "ts": TS}})
     _patch(monkeypatch, fake)
-    signed = "x" * (UPDATE_TEXT_MAX - len(SIG) - 1) + "\n" + SIG
+    signed = "x" * (UPDATE_TEXT_MAX - len(SIG) - 2) + "\n\n" + SIG
 
     result = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text=signed))
 
     assert result.startswith("# Message updated")
     assert fake.calls[0][1]["text"] == signed
+
+
+async def test_a_signed_text_whose_rewritten_blank_line_crosses_the_cap_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Signed with a single newline (the pre-t15 separator) and exactly at the cap: the blank line adds one."""
+    _sign_with(monkeypatch)
+    fake = _FakeClient(routes={"chat.update": {"ok": True, "channel": CHANNEL, "ts": TS}})
+    _patch(monkeypatch, fake)
+    signed = "x" * (UPDATE_TEXT_MAX - len(SIG) - 1) + "\n" + SIG
+
+    result = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text=signed))
+
+    assert result.startswith(_overflow_message(UPDATE_TEXT_MAX + 1, UPDATE_TEXT_MAX, SIG)), result
+    assert fake.calls == []
 
 
 async def test_e2e_the_signature_from_the_env_goes_on_the_wire(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1096,22 +1156,23 @@ async def test_e2e_the_signature_from_the_env_goes_on_the_wire(monkeypatch: pyte
 
     result = await slack_post_message(PostMessageInput(channel=CHANNEL, text="hello"))
 
-    assert json.loads(recorder.requests[0].content)["text"] == f"hello\n{SIG}"
+    assert json.loads(recorder.requests[0].content)["text"] == f"hello\n\n{SIG}"
     assert "- **signature**: appended" in result
 
 
 # The measured fact replaced every "Sent using …" promise; this keeps the claim from coming
-# back. In the docs the phrase may appear only as the recommended SLACK_SIGNATURE value —
-# its mrkdwn form `Sent using <https://…|…>` or its markdown form `Sent using [label](https://…)`.
+# back. In the docs the phrase may appear only as a SLACK_SIGNATURE value — the recommended
+# bot-user mention `Sent using <@U…>`, or the URL fallback in its mrkdwn form
+# `Sent using <https://…|…>` or its markdown form `Sent using [label](https://…)`.
 _REPO = Path(__file__).resolve().parents[1]
 _DOCS = ("README.md", ".env.example", "SECURITY.md")
-_SIGNATURE_VALUE_USE = re.compile(r"(?i)sent using(?! <https://| \[[^\]\n]*\]\(https://)")
+_SIGNATURE_VALUE_USE = re.compile(r"(?i)sent using(?! <@U| <https://| \[[^\]\n]*\]\(https://)")
 
 
 def test_the_docs_guard_still_catches_the_old_claim() -> None:
     old = 'Posts show your name plus Slack\'s "Sent using @<app>" line; the "Sent using …" line.'
     assert len(_SIGNATURE_VALUE_USE.findall(old)) == 2
-    assert _SIGNATURE_VALUE_USE.findall(f"{SIG}\n{SIG_MD}") == []
+    assert _SIGNATURE_VALUE_USE.findall(f"{SIG}\n{SIG_MD}\n{MENTION_SIG}\nSent using <@U0BOTID>") == []
 
 
 def test_no_source_file_claims_a_sent_using_line() -> None:

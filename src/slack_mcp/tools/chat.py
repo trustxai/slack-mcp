@@ -4,7 +4,8 @@ Every tool here writes with the user token, so Slack shows the message under you
 name and avatar. Slack does not label these messages: they look exactly like ones you
 typed (measured 2026-10-10 with an internal app, in a self-DM and in a channel).
 To let teammates tell them apart, set `SLACK_SIGNATURE` — `_sign` appends it as the last
-line of every message these tools post, reply, schedule or edit, never twice. The tools
+line, after a blank line, of every message these tools post, reply, schedule or edit,
+never twice. The tools
 never gate, never retry and never pick an encoding: `client.call()` runs the write guard
 on the exact parameters that go on the wire (kill-switch, ID-only channel allowlist, DM
 membership, Slack Connect refusal), sends `chat.postMessage` / `chat.update` /
@@ -113,11 +114,11 @@ def _signature_for(fmt: MessageFormat, signature: str) -> str:
     return _MRKDWN_LINK.sub(lambda m: f"[{_markdown_label(m.group(2))}]({m.group(1)})", signature)
 
 
-# What goes between the text and the signature. In mrkdwn a newline is a line break. In
-# Markdown a single newline after a list item, a `>` quote or a table row continues that
-# block (the signature would render as part of the last bullet / quote / row), so there
-# it follows a BLANK line — a paragraph of its own.
-_SIGNATURE_SEPARATOR: dict[MessageFormat, str] = {"mrkdwn": "\n", "markdown": "\n\n"}
+# What goes between the text and the signature: a BLANK line, in both formats. In mrkdwn
+# that keeps the signature visibly apart from the message (a single newline glued it to
+# the last line). In Markdown it is also what keeps it out of the block above: a single
+# newline after a list item, a `>` quote or a table row continues that block.
+_SIGNATURE_SEPARATOR = "\n\n"
 
 
 def _comparable(line: str) -> str:
@@ -142,26 +143,25 @@ def _is_signature_line(line: str, signature: str) -> bool:
 def _sign(text: str, settings: Settings, fmt: MessageFormat = "mrkdwn") -> tuple[str, bool]:
     """`(text to send, appended?)` — the text plus the signature line, unless it already ends with it.
 
-    Appends `"\\n" + signature` for mrkdwn and `"\\n\\n" + signature` (after a blank line)
-    for markdown. "Already ends with it" means the LAST line, trailing whitespace ignored,
-    is the signature in either form (`_is_signature_line`, entities decoded): that line is
-    then rewritten as the signature for `fmt`, behind that format's separator, so an edit
-    of a signed message — even from Slack's read-back text, or in the other format — keeps
-    exactly one signature, and in markdown it always stands after a blank line (never
-    inside the list item, quote or table row above it). A signature quoted in the middle of
-    the text does not count: the text is signed again at the end. No signature configured
-    → the text unchanged.
+    Appends `"\\n\\n" + signature` — after a blank line — in both formats. "Already ends
+    with it" means the LAST line, trailing whitespace ignored, is the signature in either
+    form (`_is_signature_line`, entities decoded), whatever number of blank lines precedes
+    it: that line is then rewritten as the signature for `fmt`, behind exactly one blank
+    line, so an edit of a signed message — even from Slack's read-back text, or in the
+    other format — keeps exactly one signature, always standing apart from the text (and
+    in markdown never inside the list item, quote or table row above it). A signature
+    quoted in the middle of the text does not count: the text is signed again at the end.
+    No signature configured → the text unchanged.
     """
     if settings.signature is None:
         return text, False
     signature = _signature_for(fmt, settings.signature)
-    separator = _SIGNATURE_SEPARATOR[fmt]
     body = text.rstrip()
     head, _, last = body.rpartition("\n")
     if _is_signature_line(last, settings.signature):
         head = head.rstrip()
-        return (f"{head}{separator}{signature}" if head else signature), False
-    return f"{body}{separator}{signature}", True
+        return (f"{head}{_SIGNATURE_SEPARATOR}{signature}" if head else signature), False
+    return f"{body}{_SIGNATURE_SEPARATOR}{signature}", True
 
 
 class SignedTextTooLongError(RuntimeError):
@@ -179,7 +179,7 @@ def _prepare_text(text: str, fmt: MessageFormat, limit: int, why: str) -> tuple[
     if len(final) > limit:
         signature = _signature_for(fmt, settings.signature or "")
         # `final != text` also covers an existing signature line that was rewritten (its
-        # markdown blank line, or the other format's form), which can add characters.
+        # blank line, or the other format's form), which can add characters.
         included = f" including the {len(signature):,}-character signature (SLACK_SIGNATURE)" if final != text else ""
         over = len(final) - limit
         raise SignedTextTooLongError(
@@ -471,8 +471,8 @@ async def slack_post_message(params: PostMessageInput) -> str:
     Calls `chat.postMessage` once with your user token, so the message shows your name
     and avatar — there is no bot identity. Slack does not label these messages: they look
     exactly like ones you typed. To let teammates tell them apart, set `SLACK_SIGNATURE` —
-    the server appends it as the last line of every message it posts (not again if the
-    text already ends with it; it counts toward the length limits below).
+    the server appends it as the last line, after a blank line, of every message it posts
+    (not again if the text already ends with it; it counts toward the length limits below).
     The text goes out verbatim. With `format="mrkdwn"` (default) it is sent as `text` in
     Slack's own syntax: `*bold*` (single asterisks), `_italic_`, `` `code` ``,
     `<@U0123ABCDEF>` to mention someone (an id, never a name), `<https://x.y|label>` for a
