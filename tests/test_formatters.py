@@ -20,6 +20,7 @@ from slack_mcp.formatters import (
     md_cell,
     message_text,
     mrkdwn_escape,
+    mrkdwn_links_to_markdown,
     paginated_response,
     render_mention,
     render_message,
@@ -272,6 +273,46 @@ def test_blocks_it_cannot_read_keep_the_text_with_the_context_text_on_its_own_la
     assert message_text({"text": SIGNATURE, "blocks": [rich, _context(SIGNATURE)]}) == SIGNATURE
     buttons = {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "OK"}}]}
     assert message_text({"text": "Approve?", "blocks": [_section("Approve?"), buttons]}) == "Approve?"
+
+
+def test_the_trailing_context_text_is_lifted_only_on_a_whitespace_boundary() -> None:
+    rich = {"type": "rich_text", "elements": []}
+    # "bot" ends "robot" but is not a word of its own there: nothing moves.
+    assert message_text({"text": "posted by the robot", "blocks": [rich, _context("bot")]}) == "posted by the robot"
+    assert message_text({"text": "posted by the robot", "blocks": [rich, _context("robot")]}) == (
+        "posted by the\nrobot"
+    )
+    assert message_text({"text": f"tail{SIGNATURE}", "blocks": [rich, _context(SIGNATURE)]}) == f"tail{SIGNATURE}"
+
+
+def test_the_trailing_context_text_matches_in_its_markdown_link_form_too() -> None:
+    """A `format="markdown"` post: its fallback carries `[label](url)`, its context block `<url|label>`."""
+    url_signature = "*Sent using* <https://x.example/marketplace/A0APP|@Alejandro AI>"
+    fallback = "## Plan - **one**  *Sent using* [@Alejandro AI](https://x.example/marketplace/A0APP)"
+    message = {"text": fallback, "blocks": [{"type": "rich_text", "elements": []}, _context(url_signature)]}
+    assert (
+        message_text(message) == "## Plan - **one**\n*Sent using* [@Alejandro AI](https://x.example/marketplace/A0APP)"
+    )
+    assert (
+        mrkdwn_links_to_markdown(url_signature) == "*Sent using* [@Alejandro AI](https://x.example/marketplace/A0APP)"
+    )
+
+
+def test_a_leading_context_block_keeps_its_place() -> None:
+    """Block order is kept: a third-party app's header context stays above the body."""
+    message = {
+        "text": "flattened",
+        "blocks": [_context("Posted by Deploybot"), _section("v2 is live"), _context("2 minutes ago")],
+    }
+    assert message_text(message) == "Posted by Deploybot\nv2 is live\n2 minutes ago"
+
+
+@pytest.mark.parametrize("odd", [["section"], {"a": 1}, 7, None])
+def test_an_odd_block_type_never_crashes_a_page(odd: Any) -> None:
+    message = {"ts": TS, "user": "U0123ABCDEF", "text": "kept", "blocks": [{"type": odd}, _section("x"), "junk"]}
+    assert message_text(message) == "kept"  # an unknown block: Slack's `text`
+    assert render_message(message) == f"[2024-04-05 19:34 UTC] U0123ABCDEF: kept (ts {TS})"
+    assert message_text({"text": "kept", "blocks": [{"type": odd}]}) == "kept"
 
 
 def test_block_messages_keep_names_lookup_and_the_one_line_author() -> None:

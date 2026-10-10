@@ -113,8 +113,8 @@ class Settings(BaseSettings):
         return value.strip() if isinstance(value, str) else value
 
     # The signature must stay ONE line: the chat tools recognise an already-signed text by
-    # its last line, and a pasted value often carries a stray newline. Stripped, like the
-    # other strings.
+    # the signature at its end (Slack's read-back flattens newlines to spaces), and a pasted
+    # value often carries a stray newline. Stripped, like the other strings.
     @field_validator("slack_signature", mode="before")
     @classmethod
     def _one_line(cls, value: object) -> object:

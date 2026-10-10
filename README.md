@@ -491,9 +491,18 @@ line, and any app can post the same block. How it behaves:
 - Slack flattens the `text` fallback of a message posted with blocks when it stores it:
   every newline becomes a space (measured 2026-10-10), so it reads back as one line. The
   read tools (`slack_get_thread`, `slack_get_history`) rebuild the text from the blocks,
-  so what you read back is what was posted: the text with its line breaks, then the
-  signature as its last line. A message typed by a person (only `rich_text` blocks)
-  still reads back from `text`; JSON mode returns the raw messages, blocks included.
+  so for `format: "mrkdwn"` what you read back is what was posted: the text with its
+  line breaks, then the signature as its last line. This applies to every app-built
+  message, not only the server's: text another app put only in its `text` fallback is
+  not shown in markdown mode (JSON mode returns the raw messages, `text` and blocks
+  included). A message typed by a person (only `rich_text` blocks) still reads back
+  from `text`.
+
+  One v0.1 limit: Slack stores a `markdown` block as `rich_text` (measured 2026-10-10),
+  so a message posted with `format: "markdown"` reads back from its flattened `text`, as
+  one line with only the signature on its own last line. Editing it from that read-back
+  loses its line structure (headings, lists and paragraphs run together). Pass the
+  original text when you edit such a message.
 - `slack_update_message` resends the blocks with every edit, replacing the old ones (an
   edit that sends only `text` would drop them). The signature is appended unless the new
   text already ends with it, so an edit of a signed message stays signed exactly once:
@@ -510,7 +519,7 @@ line, and any app can post the same block. How it behaves:
   characters (the limit for a context block's text) and a text that would need more than
   49 sections (Slack allows 50 blocks per message, the context block included).
 - Every confirmation has a `signature` line (`appended (context block)`,
-  `already the last line … (context block)`, or `not configured`), and
+  `already at the end … (context block)`, or `not configured`), and
   `slack_health_check` shows `on (N chars)` or `off`.
 
 ## Formatting cheatsheet

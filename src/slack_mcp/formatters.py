@@ -9,6 +9,7 @@ an error may.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -111,6 +112,25 @@ def mrkdwn_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# A mrkdwn link `<https://…|label>` (or mailto:). Mentions (`<@U…>`), channel links
+# (`<#C…|name>`) and specials (`<!here>`) do not match: they are not URLs.
+_MRKDWN_LINK = re.compile(r"<((?:https?|mailto):[^|<>\s]+)\|([^<>]+)>")
+
+
+def _markdown_link(match: re.Match[str]) -> str:
+    label = match.group(2).replace("[", "\\[").replace("]", "\\]")
+    return f"[{label}]({match.group(1)})"
+
+
+def mrkdwn_links_to_markdown(text: str) -> str:
+    """Every mrkdwn `<url|label>` link in `text` as a Markdown `[label](url)` (brackets in the label escaped).
+
+    A bare `<url>` is already a Markdown autolink and stays; so do mentions, channel links
+    and specials. This is how the chat tools write SLACK_SIGNATURE for `format="markdown"`.
+    """
+    return _MRKDWN_LINK.sub(_markdown_link, text)
+
+
 def md_cell(value: Any, *, max_len: int = 200) -> str:
     """Make a value safe inside a markdown table cell: no newlines, escaped pipes, clipped."""
     if value in (None, ""):
@@ -143,17 +163,36 @@ def _context_line(block: Mapping[str, Any]) -> str:
     return " ".join(text for text in (_text_object(element).strip() for element in elements) if text)
 
 
-def _body_parts(block: Mapping[str, Any]) -> list[str]:
-    """The text a section (its text, then its fields), markdown or header block shows."""
+def _block_kind(block: Mapping[str, Any]) -> str:
+    """A block's `type`, or '' when it is not a string (an odd payload never crashes a page)."""
     kind = block.get("type")
+    return kind if isinstance(kind, str) else ""
+
+
+def _block_lines(block: Mapping[str, Any]) -> list[str]:
+    """The text a readable block shows: a section's text then its fields, a markdown or header block's text,
+    a context block's text elements on one line; nothing for a divider."""
+    kind = _block_kind(block)
+    if kind == "context":
+        return [_context_line(block)]
     if kind == "markdown":
         text = block.get("text")
         return [text] if isinstance(text, str) else []
+    if kind not in {"section", "header"}:
+        return []
     parts = [_text_object(block.get("text"))]
     fields = block.get("fields") if kind == "section" else None
     if isinstance(fields, list | tuple):
         parts.extend(_text_object(field) for field in fields)
     return parts
+
+
+def _lift_trailing(text: str, line: str) -> str | None:
+    """`text` with `line` — found at its end after whitespace — moved onto a last line of its own; None if not."""
+    flattened = text.rstrip()
+    if len(flattened) > len(line) and flattened.endswith(line) and flattened[-len(line) - 1].isspace():
+        return f"{flattened[: -len(line)].rstrip()}\n{line}"
+    return None
 
 
 def message_text(message: Mapping[str, Any]) -> str:
@@ -163,34 +202,34 @@ def message_text(message: Mapping[str, Any]) -> str:
     turned into a space (measured 2026-10-10: `body\\n\\nsignature` read back as
     `body  signature`), while the blocks come back verbatim. So when `blocks` holds a
     `section`, `markdown` or `context` block and nothing this cannot read, the text is
-    rebuilt from them, in order: each section's text (then its fields), markdown block and
-    header joined with `\\n`, then every context block's text elements (joined with a
-    space) as the LAST line(s) — the shape the message was posted in, a signature once, on
-    its own line. A message with no blocks, or only `rich_text` ones (typed by a person),
-    keeps `text`. So does one that mixes app blocks with blocks this cannot read (rich
-    text, tables, images, buttons — e.g. what Slack may translate a `markdown` block into),
-    except that a context text ending its flattened `text` is moved onto a last line of
-    its own. Nothing to rebuild → `text`.
+    rebuilt from them, in their order, joined with `\\n`: a section's text (then its
+    fields), a markdown or header block's text, a context block's text elements on one
+    line (joined with a space). The chat tools put the signature's context block last, so
+    it reads back once, as the last line, the shape it was posted in. This applies to
+    every app-built message, not only ours: text an app put only in its `text` fallback is
+    not shown (JSON mode returns it). A message with no blocks, or only `rich_text` ones
+    (typed by a person), keeps `text`. So does one that mixes app blocks with blocks this
+    cannot read (rich text, tables, images, buttons — Slack stores a `markdown` block as
+    `rich_text`, measured 2026-10-10), except that the last context block's text, when it
+    ends the flattened `text` after whitespace, is moved onto a last line of its own; its
+    `<url|label>` links are also tried as `[label](url)`, the form a `format="markdown"`
+    fallback carries. Nothing to rebuild → `text`.
     """
     text = str(message.get("text") or "")
     raw_blocks = message.get("blocks")
     blocks = [block for block in raw_blocks if isinstance(block, Mapping)] if isinstance(raw_blocks, list) else []
-    kinds = {block.get("type") for block in blocks}
+    kinds = {_block_kind(block) for block in blocks}
     if not kinds & APP_BLOCK_TYPES:
         return text
-    footer = [line for line in (_context_line(block) for block in blocks if block.get("type") == "context") if line]
     if kinds <= _READABLE_BLOCK_TYPES:
-        body = [
-            part
-            for block in blocks
-            if block.get("type") in {"section", "markdown", "header"}
-            for part in _body_parts(block)
-            if part.strip()
-        ]
-        return "\n".join(body + footer) or text
-    flattened = text.rstrip()
-    if footer and flattened.endswith(footer[-1]) and len(flattened) > len(footer[-1]):
-        return f"{flattened[: -len(footer[-1])].rstrip()}\n{footer[-1]}"
+        lines = [line for block in blocks for line in _block_lines(block) if line.strip()]
+        return "\n".join(lines) or text
+    footer = [line for block in blocks if _block_kind(block) == "context" for line in _block_lines(block) if line]
+    if footer:
+        for form in dict.fromkeys((footer[-1], mrkdwn_links_to_markdown(footer[-1]))):
+            lifted = _lift_trailing(text, form)
+            if lifted is not None:
+                return lifted
     return text
 
 

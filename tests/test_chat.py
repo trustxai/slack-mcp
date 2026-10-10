@@ -888,7 +888,7 @@ async def test_update_from_the_flattened_live_read_back_keeps_one_signature(monk
     result = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text=LIVE_DOUBLED))
 
     assert fake.calls[0][1] == {"channel": CHANNEL, "ts": TS, **_message(LIVE_BODY, "mrkdwn", LIVE_SIG)}
-    assert "- **signature**: already the last line of the text — not added again (context block)" in result
+    assert "- **signature**: already at the end of the text — not added again (context block)" in result
 
 
 @pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
@@ -1267,7 +1267,7 @@ async def test_update_of_a_signed_message_stays_signed_exactly_once(
     assert params == {"channel": CHANNEL, "ts": TS, **_message("Deploy done (v2)", fmt, signature)}
     assert params["text"].count(_signature_for(fmt, signature)) == 1
     assert all("Sent using" not in text for text in _body_texts(params))  # never inside a body block
-    assert "- **signature**: already the last line of the text — not added again (context block)" in result
+    assert "- **signature**: already at the end of the text — not added again (context block)" in result
     assert result.count(_signature_for(fmt, signature)) == 1  # only in Slack's stored text
 
 
@@ -1289,7 +1289,7 @@ async def test_update_from_slacks_read_back_text_with_entities_does_not_double_s
     assert params["text"].count("@Alejandro AI") == 1
     assert _body_texts(params) == ["Deploy done &amp; re-verified"]  # the read-back signature line is cut
     assert params["blocks"][-1] == _context(AMP_SIG)
-    assert "- **signature**: already the last line of the text — not added again (context block)" in result
+    assert "- **signature**: already at the end of the text — not added again (context block)" in result
 
 
 @pytest.mark.parametrize("gap", ["\n", "\n\n", "\n\n\n", "\n  \n"])

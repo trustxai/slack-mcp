@@ -39,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from slack_mcp.client import SlackClient, get_client
 from slack_mcp.config import Settings, get_settings
 from slack_mcp.errors import SlackApiError, handle_api_error, hint_for
-from slack_mcp.formatters import clip_response, fmt_warnings, ts_to_human
+from slack_mcp.formatters import clip_response, fmt_warnings, mrkdwn_links_to_markdown, ts_to_human
 from slack_mcp.server import mcp
 from slack_mcp.validators import channel_id, iso_to_epoch, message_ts
 
@@ -106,25 +106,16 @@ def _text_field(fmt: MessageFormat, text: str) -> dict[str, str]:
 
 # -- the signature (SLACK_SIGNATURE) ---------------------------------------------
 
-# A mrkdwn link `<https://…|label>` (or mailto:). Mentions (`<@U…>`), channel links
-# (`<#C…|name>`) and specials (`<!here>`) do not match: they are not URLs.
-_MRKDWN_LINK = re.compile(r"<((?:https?|mailto):[^|<>\s]+)\|([^<>]+)>")
-
-
-def _markdown_label(label: str) -> str:
-    return label.replace("[", "\\[").replace("]", "\\]")
-
 
 def _signature_for(fmt: MessageFormat, signature: str) -> str:
     """The signature as it is written for `fmt`.
 
     `SLACK_SIGNATURE` is mrkdwn; `markdown_text` is standard Markdown, where `<url|label>`
     would render literally, so for `format="markdown"` each such link becomes
-    `[label](url)`. A bare `<url>` is already a Markdown autolink and stays as it is.
+    `[label](url)` (`formatters.mrkdwn_links_to_markdown`). A bare `<url>` is already a
+    Markdown autolink and stays as it is.
     """
-    if fmt != "markdown":
-        return signature
-    return _MRKDWN_LINK.sub(lambda m: f"[{_markdown_label(m.group(2))}]({m.group(1)})", signature)
+    return mrkdwn_links_to_markdown(signature) if fmt == "markdown" else signature
 
 
 # What goes between the text and the signature: a BLANK line, in both formats. In mrkdwn
@@ -378,7 +369,7 @@ def _prepare_message(text: str, fmt: MessageFormat, limit: int, why: str) -> tup
     if appended:
         line = "- **signature**: appended (context block)"
     elif settings.signature is not None:
-        line = "- **signature**: already the last line of the text — not added again (context block)"
+        line = "- **signature**: already at the end of the text — not added again (context block)"
     else:
         line = "- **signature**: not configured"
     return fields, line
@@ -841,8 +832,13 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
     it from the text), so an edit of a signed message — the text read back with
     `slack_get_thread` / `slack_get_history`, changed — stays signed exactly once. Slack
     flattens the `text` fallback of a message posted with blocks (every newline stored as
-    a space); the read tools rebuild the text from the blocks, so what you read back is
-    what was posted — the signature on its own last line. With a signature the edit
+    a space); the read tools rebuild the text from the blocks, so for `format="mrkdwn"`
+    what you read back is what was posted — the signature on its own last line. One v0.1
+    limit: Slack stores a `markdown` block as `rich_text` (measured 2026-10-10), so a
+    message posted with `format: "markdown"` reads back from its flattened `text`, as one
+    line with only the signature on its own last line. Editing it from that read-back
+    loses its line structure (headings, lists and paragraphs run together). Pass the
+    original text when you edit such a message. With a signature the edit
     always resends the `blocks` too (the text without its signature, then the signature's
     `context` block), replacing the old ones; Slack does not show its "edited" mark on an
     edit made with blocks. `format` works as in `slack_post_message`: unsigned, `mrkdwn` →
@@ -869,7 +865,7 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
 
     Returns:
     A confirmation echoing only what Slack returned: `channel`, `ts`, the stored `text`,
-    and any Slack warning — plus a `signature` line (appended / already the last line /
+    and any Slack warning — plus a `signature` line (appended / already at the end /
     not configured) and, for an edit sent with blocks, a note that Slack hides its
     "edited" mark on it — or an `Error ...` string.
 

@@ -35,7 +35,9 @@ set for the run (shell or .env), it also asserts that the post (after that edit)
 thread reply end with the signature on its own last line, exactly once in each one's
 rendered text (twice in the thread); and, in JSON mode (the raw messages), that each raw
 `text` holds it exactly once, that both carry ONE Block Kit `context` block holding it
-(t16), and that no other block of theirs (`section` / `markdown`) contains it. Unset, the
+(t16), and that no other block of theirs (`section` / `markdown`) contains it. The
+markdown post (stored by Slack as `rich_text` + context, so it reads back from its
+flattened `text`) must show the signature once, on its own last line. Unset, the
 signature checks are skipped and the result block says so.
 """
 
@@ -56,7 +58,13 @@ import pytest
 from slack_mcp.client import SlackClient, get_client, reset_client
 from slack_mcp.config import get_settings
 from slack_mcp.errors import SlackApiError
-from slack_mcp.formatters import MESSAGE_CONTINUATION, ResponseFormat, message_text, render_message
+from slack_mcp.formatters import (
+    MESSAGE_CONTINUATION,
+    ResponseFormat,
+    message_text,
+    mrkdwn_links_to_markdown,
+    render_message,
+)
 from slack_mcp.tools.chat import (
     PostMessageInput,
     ReplyInThreadInput,
@@ -348,8 +356,11 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
             assert plain_signature not in html.unescape(others), (
                 f"step 9 signature: the stored {label} ({ts}) repeats the signature inside a body block: {others[:1500]}"
             )
-        # The markdown post is not asserted — how Slack stores markdown_text is not measured
-        # yet — only recorded, to compare by eye with its permalink.
+        # The markdown post: Slack stores its `markdown` block as `rich_text` (measured
+        # 2026-10-10: block types ['rich_text', 'context']), so it reads back from its flattened
+        # `text` — one line — with only the signature lifted onto its own last line, in the
+        # markdown form its fallback carries (`[label](url)` for a URL signature). The block
+        # types are still recorded, to see if Slack ever changes that.
         md_thread = await slack_get_thread(GetThreadInput(channel=dm, thread_ts=_RUN["md_ts"], limit=1))
         md_raw = await slack_get_thread(
             GetThreadInput(channel=dm, thread_ts=_RUN["md_ts"], limit=1, response_format=ResponseFormat.JSON)
@@ -361,10 +372,19 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
             for block in item.get("blocks") or []
             if isinstance(block, dict)
         ]
+        plain_md, md_signature = html.unescape(md_thread), html.unescape(mrkdwn_links_to_markdown(signature))
+        assert plain_md.count(md_signature) == 1, (
+            f"step 9 signature: the markdown post shows SLACK_SIGNATURE {plain_md.count(md_signature)} time(s), "
+            f"not once (stored block types {md_block_types}):\n{md_thread}"
+        )
+        assert f"\n{MESSAGE_CONTINUATION}{md_signature} (ts {_RUN['md_ts']})" in plain_md, (
+            f"step 9 signature: the markdown post does not end with SLACK_SIGNATURE on a line of its own "
+            f"(stored block types {md_block_types}):\n{md_thread}"
+        )
         _RUN["signature"] = (
             f"on ({len(signature)} chars) — verified once, as the last line read back (rebuilt from the blocks), of "
             f"the post (after its edit from that read-back) and of the reply, once in each raw `text`, and as their "
-            f"one context block; the markdown post's last line reads back as: "
+            f"one context block; the markdown post shows it once, on its own last line: "
             f"{_line(md_thread, '(ts ' + _RUN['md_ts'] + ')')!r}, its stored block types: {md_block_types}"
         )
     else:
