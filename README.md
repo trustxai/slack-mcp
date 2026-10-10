@@ -8,8 +8,9 @@ your own internal Slack app, so everything it posts shows your name and avatar, 
 everything it reads is what you can see in Slack. Slack does not label these messages:
 they look exactly like ones you typed (measured with an internal app, in a self-DM and in
 a channel). To let teammates tell them apart, set `SLACK_SIGNATURE` — the server
-appends it as the last line of every message it posts, replies with or schedules, and
-keeps it on edits. See [Signing your messages](#signing-your-messages).
+appends it as the last line, after a blank line, of every message it posts, replies with
+or schedules, and keeps it on edits. The recommended value mentions your app's bot user
+(`Sent using <@U0BOTID>`). See [Signing your messages](#signing-your-messages).
 
 You create **one personal, internal app per workspace** (see [Prerequisites](#prerequisites--create-the-slack-app)).
 The server runs over **stdio only**. There is no HTTP transport, so a token that acts as
@@ -105,7 +106,8 @@ every one is in the [table](#available-tools).
   message's permalink. If the permalink lookup fails, the message is still reported as
   sent. Every confirmation repeats only what Slack returned, including any warning Slack
   attached, plus a `signature` line: `SLACK_SIGNATURE`, when set, is appended as the last
-  line of every post, reply and scheduled message, and an edit keeps it exactly once.
+  line (after a blank line) of every post, reply and scheduled message, and an edit keeps
+  it exactly once.
 - **Reactions.** `slack_add_reaction` 🔒 and `slack_remove_reaction` 🔒 (yours only).
   Colons around the emoji name are stripped. "Already there" and "not there" are
   reported as outcomes, not errors.
@@ -192,7 +194,9 @@ and one Slack app **per workspace**, created by you, for you:
    `channels:write` and `reactions:read` are deliberately absent: no tool joins a channel
    or reads a message's reactions, and `channels:write` would also allow archiving,
    creating, renaming and kicking. Leave Bot Token Scopes empty, because this server
-   never uses a bot token.
+   never uses a bot token — the one exception is the single bot scope (`users:read`) of
+   the bot user the recommended signature mentions, if you add it
+   ([Signing your messages](#signing-your-messages)).
 3. **Token rotation: leave it OFF.** Slack says rotation "may not be turned off once it's
    turned on", and a rotated token (`xoxe.xoxp-…`) expires every 12 hours. This server
    has no refresh flow: it accepts such a token, and the health check warns that it will
@@ -202,7 +206,8 @@ and one Slack app **per workspace**, created by you, for you:
    those apps drop to 1 request a minute on history and threads, while internal apps keep
    their limits. An undistributed app lives in a single workspace, which is why a second workspace needs a second app.
 5. **Install to Workspace** → allow → copy the **User OAuth Token** (`xoxp-…`). That
-   value is your `SLACK_USER_TOKEN`.
+   value is your `SLACK_USER_TOKEN`. If the app has a bot user, the page also shows a
+   *Bot User OAuth Token* (`xoxb-…`): never use that one — the server refuses it.
 
 Scopes only ever get added to an issued token: Slack says "it is not possible to
 downgrade an access token's scopes". To add a scope later, add it and **reinstall** the
@@ -387,7 +392,7 @@ changing one. String values are whitespace-stripped. Real environment variables 
 | `SLACK_ALLOW_WRITES` | off | Kill-switch. `1` allows posting, replying, editing, scheduling, reacting and opening DMs, and even then every write must pass the allowlists. |
 | `SLACK_WRITE_CHANNELS` | *(empty)* | Comma-separated conversation IDs (`C…`, `G…`, `D…`) a write may target. IDs only; a `#name` never matches. The only way to write to a Slack Connect channel or a shared group DM. |
 | `SLACK_WRITE_USERS` | *(empty)* | Comma-separated user IDs (`U…`, `W…`). A DM or group DM is writable when every *other* member is listed, and `slack_open_conversation` only opens conversations with these people. Your own self-DM needs no entry. |
-| `SLACK_SIGNATURE` | *(empty = off)* | A line the server appends (`"\n"` + signature; after a blank line for `format: "markdown"`) to every message it posts, replies with or schedules, and keeps on edits — never twice. Slack does not label these messages, so this is how teammates can tell them apart. Slack mrkdwn, one line (a multi-line value is joined into one); it counts toward the length limits. See [Signing your messages](#signing-your-messages). |
+| `SLACK_SIGNATURE` | *(empty = off)* | A line the server appends after a blank line (`"\n\n"` + signature, in both formats) to every message it posts, replies with or schedules, and keeps on edits — never twice. Slack does not label these messages, so this is how teammates can tell them apart. Recommended: `Sent using <@U0BOTID>`, a mention of your app's bot user. Slack mrkdwn, one line (a multi-line value is joined into one); it counts toward the length limits. See [Signing your messages](#signing-your-messages). |
 | `SLACK_API_URL` | `https://slack.com/api` | Web API base URL, for proxies and tests. Must be `https://`; plain `http://` is accepted only for `127.0.0.1` / `localhost`. |
 | `SLACK_REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout. A timed-out write is reported as outcome UNKNOWN, never retried. |
 | `SLACK_TEST_ALLOW_WRITES` | *(unset)* | **Test suite only**, never read by the server. `1` opens the `live_write` tests, but only when it is in the environment pytest starts with (a value in `.env` is ignored for this variable) and only with exactly `-m live_write`. See [Running the tests](#running-the-tests). |
@@ -397,9 +402,46 @@ changing one. String values are whitespace-stripped. Real environment variables 
 Slack does not label these messages: they look exactly like ones you typed. Measured on
 2026-10-10 with an internal app and a user token, in a self-DM and in a channel:
 no app label under the message. To let teammates tell them apart, set `SLACK_SIGNATURE`
-— the server appends it as the last line of every message it posts. The closest match to
-an app label is a link to your app's page, which renders the `@Alejandro AI` part in link
-colour, like a tag:
+— the server appends it as the last line of every message it posts, after a blank line.
+
+The recommended value is a real Slack mention of your app's **bot user**:
+
+```sh
+# .env — the bot user's id (U…), found as in step 3 below
+SLACK_SIGNATURE=Sent using <@U0BOTID>
+```
+
+Slack renders the mention as the blue `@Alejandro AI` tag, and clicking it opens the
+app's profile inside Slack — a link would open the web browser instead. A mention works
+in both formats: `markdown_text` takes `<@U…>` too, and the server leaves it as it is.
+The app gets a bot user only so it can be mentioned. Its bot token is never used, and
+the server refuses it anyway (`xoxb-…`). To add one:
+
+1. <https://api.slack.com/apps> → your app → **App Manifest** → add these keys, keeping
+   the user scopes as they are:
+
+   ```yaml
+   features:
+     bot_user:
+       display_name: Alejandro AI
+       always_online: false
+   oauth_config:
+     scopes:
+       bot:
+         - users:read
+   ```
+
+   One bot scope, `users:read`, because Slack does not install a bot user without one.
+   It is a bot scope: it does not go on your user token, whose 15 scopes stay as they are.
+2. **Save**, then **Install App** → **Reinstall to Workspace**. `SLACK_USER_TOKEN` stays
+   the **User OAuth Token** (`xoxp-…`; copy it again if it changed), never the new *Bot
+   User OAuth Token* (`xoxb-…`).
+3. Find the bot user's id with `slack_list_users` and `include_bots: true` (bots are
+   hidden by default), or with `slack_resolve_user`, `query: "Alejandro AI"` and
+   `include_bots: true`. It is a `U…` id: that is what goes in `<@…>`.
+
+Without a bot user, the fallback is a link to your app's page. It renders the
+`@Alejandro AI` part in link colour, like a tag, but opens the web:
 
 ```sh
 # .env — your workspace's subdomain, and the App ID from your app's Basic Information page
@@ -407,39 +449,44 @@ SLACK_SIGNATURE=Sent using <https://<workspace>.slack.com/marketplace/<APP_ID>|@
 ```
 
 For example, the author's app in the Masava workspace is
-`Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>`. In a
-shell, quote the value (`<`, `>` and `|` are shell metacharacters); in a client's JSON
-`env` block it is an ordinary string. Slack's own small grey app label cannot be
-produced by a message, so this line is plain message text — a marker, not provenance:
+`Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>`.
+
+In a shell, quote the value (`<`, `>` and `|` are shell metacharacters); in a client's
+JSON `env` block it is an ordinary string. Slack's own small grey app label cannot be
+produced by a message, so either line is plain message text — a marker, not provenance:
 anyone can type the same line by hand. How it behaves:
 
 - It is added as a new last line to `slack_post_message`, `slack_reply_in_thread` and
-  `slack_schedule_message`, in both formats. Write it in mrkdwn. With the default
-  `format: "mrkdwn"` it follows a single line break (`"\n"` + signature). With
-  `format: "markdown"` it follows a **blank line** (`"\n\n"` + signature), because in
-  Markdown a line right after a list item, a `>` quote or a table row would be pulled
-  into that block, and each `<url|label>` link is rewritten as `[label](url)`. With the
-  value above, what goes to Slack is:
+  `slack_schedule_message`, in both formats, always after a **blank line** (`"\n\n"` +
+  signature): it stands visibly apart from the message, and in Markdown it cannot be
+  pulled into a list item, `>` quote or table row above it. Write it in mrkdwn. With
+  `format: "markdown"` each `<url|label>` link is rewritten as `[label](url)`; a `<@U…>`
+  mention stays as it is. With the recommended value, what goes to Slack is:
 
   ```text
   format "mrkdwn":    Deploy done :rocket:
-                      Sent using <https://<workspace>.slack.com/marketplace/<APP_ID>|@Alejandro AI>
+
+                      Sent using <@U0BOTID>
 
   format "markdown":  - one
                       - two
 
-                      Sent using [@Alejandro AI](https://<workspace>.slack.com/marketplace/<APP_ID>)
+                      Sent using <@U0BOTID>
   ```
 
+  With the link fallback, the markdown line reads
+  `Sent using [@Alejandro AI](https://<workspace>.slack.com/marketplace/<APP_ID>)`.
 - `slack_update_message` applies the same rule: the signature is appended unless the new
   text already ends with it, so an edit of a signed message stays signed exactly once.
-  The last line counts in either form (`<url|label>` or `[label](url)`, so switching
-  `format` on an edit is safe) and as Slack stores it (`&` read back as `&amp;`), so
-  editing the text read back from Slack does not add a second line. In markdown an
-  existing signature line is moved behind a blank line. A signature quoted in the middle
-  of a text does not count; the text is signed again at the end.
-- It counts toward Slack's length limits. A text that only goes over because of the
-  signature is refused before anything is sent, and the error says so.
+  The last line counts whatever number of blank lines comes before it, in either form
+  (`<url|label>` or `[label](url)`, so switching `format` on an edit is safe) and as
+  Slack stores it (`&` read back as `&amp;`), so editing the text read back from Slack
+  does not add a second line. A signature line right under the text (no blank line, as
+  in a message signed before this rule) is moved behind a blank line. A signature quoted
+  in the middle of a text does not count; the text is signed again at the end.
+- It counts toward Slack's length limits, blank line included. A text that only goes
+  over because of the signature is refused before anything is sent, and the error says
+  so.
 - Every confirmation has a `signature` line (`appended`, `already the last line …`, or
   `not configured`), and `slack_health_check` shows `on (N chars)` or `off`.
 

@@ -30,8 +30,8 @@ Slack shows NO native app label under these posts — they look exactly like one
 STORED IT (read back with `slack_get_thread`, so a signed post comes back signed and
 entity-encoded), which is the edit flow that must not double-sign. When the signature is
 set for the run (shell or .env), step 9 asserts that the post (after that edit) and the
-thread reply end with the signature line, and that it appears exactly twice in the thread
-(once each); unset, that check is skipped and the result block says so.
+thread reply end with the signature line after a blank line, and that it appears exactly
+twice in the thread (once each); unset, that check is skipped and the result block says so.
 """
 
 from __future__ import annotations
@@ -285,15 +285,19 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
     assert f"{MESSAGE_CONTINUATION}{SECOND_LINE}" in thread, (
         f"step 9 get_thread: the second line is not rendered as a {MESSAGE_CONTINUATION!r} continuation:\n{thread}"
     )
-    # SLACK_SIGNATURE (O-3): when set, the post (as edited) and the reply must END with it, once.
-    # render_message puts the `(ts …)` suffix on a message's last line, so "last line == the
-    # signature" reads as `  │ <signature> (ts <ts>)`. Compared entity-decoded: Slack stores
-    # an `&` of the signature as `&amp;`.
+    # SLACK_SIGNATURE (O-3): when set, the post (as edited) and the reply must END with it, once,
+    # after a blank line (t15). render_message prefixes every line after the first with `  │ `
+    # (the blank line reads `  │`, its trailing space stripped) and puts the `(ts …)` suffix on
+    # a message's last line, so "a blank line, then the signature as the last line" reads as
+    # `  │` + newline + `  │ <signature> (ts <ts>)` — the shape test_chat pins offline against
+    # render_message. Compared entity-decoded: Slack stores an `&` of the signature as `&amp;`.
     if signature:
         plain_thread, plain_signature = html.unescape(thread), html.unescape(signature)
+        blank_line = MESSAGE_CONTINUATION.rstrip()
         for label, ts in (("post, after its edit", ts1), ("thread reply", reply_ts)):
-            assert f"{MESSAGE_CONTINUATION}{plain_signature} (ts {ts})" in plain_thread, (
-                f"step 9 signature: the {label} ({ts}) does not end with SLACK_SIGNATURE {signature!r}:\n{thread}"
+            assert f"\n{blank_line}\n{MESSAGE_CONTINUATION}{plain_signature} (ts {ts})" in plain_thread, (
+                f"step 9 signature: the {label} ({ts}) does not end with a blank line and then SLACK_SIGNATURE "
+                f"{signature!r}:\n{thread}"
             )
         assert plain_thread.count(plain_signature) == 2, (
             f"step 9 signature: expected it exactly twice (post + reply), found "
@@ -303,8 +307,9 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
         # yet — only recorded, to compare by eye with its permalink.
         md_thread = await slack_get_thread(GetThreadInput(channel=dm, thread_ts=_RUN["md_ts"], limit=1))
         _RUN["signature"] = (
-            f"on ({len(signature)} chars) — verified as the last line of the post (after its edit) and of the "
-            f"reply; the markdown post's last line reads back as: {_line(md_thread, '(ts ' + _RUN['md_ts'] + ')')!r}"
+            f"on ({len(signature)} chars) — verified as the last line, after a blank line, of the post (after its "
+            f"edit) and of the reply; the markdown post's last line reads back as: "
+            f"{_line(md_thread, '(ts ' + _RUN['md_ts'] + ')')!r}"
         )
     else:
         _RUN["signature"] = "off (SLACK_SIGNATURE unset for this run) — the signature check was skipped"
