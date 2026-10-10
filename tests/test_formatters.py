@@ -178,7 +178,7 @@ def test_render_message_single_line_is_unchanged() -> None:
 
 # t17 — measured live 2026-10-10: Slack stores the `text` fallback of a message posted WITH
 # blocks with every newline turned into a space; the blocks come back verbatim.
-SIGNATURE = "*Sent using* <@U0C931FSW4Q>"
+SIGNATURE = "*Sent using* <@U0BOTUSER01>"
 
 
 def _section(text: str) -> dict[str, Any]:

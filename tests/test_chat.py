@@ -54,7 +54,7 @@ CHANNEL = "C0123ABCDEF"
 DM = "D0123ABCDEF"
 TS = "1791000000.123456"
 PARENT_TS = "1790999000.000100"
-PERMALINK = "https://udocz.slack.com/archives/C0123ABCDEF/p1791000000123456"
+PERMALINK = "https://acme.slack.com/archives/C0123ABCDEF/p1791000000123456"
 
 
 class _FakeClient:
@@ -761,7 +761,7 @@ async def test_e2e_allowlisted_post_goes_out_as_json_then_the_permalink_as_a_for
 
 # --- SLACK_SIGNATURE (measured 2026-10-10, O-3: Slack does not label user-token posts) ---
 
-APP_URL = "https://masavaco.slack.com/marketplace/A0C835DFNSH"
+APP_URL = "https://acme.slack.com/marketplace/A0123456789"
 SIG = f"Sent using <{APP_URL}|@Alejandro AI>"  # what SLACK_SIGNATURE holds (mrkdwn)
 SIG_MD = f"Sent using [@Alejandro AI]({APP_URL})"  # the same line for markdown_text
 SIGNATURES = {"mrkdwn": SIG, "markdown": SIG_MD}
@@ -821,9 +821,9 @@ def test_sign_re_signs_when_the_signature_is_not_at_the_end() -> None:
     assert _sign("Deploy done <@U0BOT000001>", Settings(slack_signature="*Sent using* <@U0BOT000001>"))[1] is True
 
 
-# t17 — measured live 2026-10-10 (Masava self-DM, raw conversations.replies): Slack stores the
-# `text` fallback of a message posted WITH blocks with every newline turned into a space.
-LIVE_SIG = "*Sent using* <@U0C931FSW4Q>"
+# t17 — measured live 2026-10-10 (a real workspace, self-DM, raw conversations.replies): Slack
+# stores the `text` fallback of a message posted WITH blocks with every newline turned into a space.
+LIVE_SIG = "*Sent using* <@U0BOTUSER01>"
 LIVE_BODY = (
     "slack-mcp t13 live write smoke slackmcpt135ba94e36e3 [EDITED by slack_update_message]: *mrkdwn bold*, a "
     "mention of <@U0ME0000001> and a link <https://example.com|example.com link>. Second line: slack_get_thread "
@@ -994,7 +994,7 @@ def test_a_signed_message_reads_back_as_posted_then_the_signature_as_its_last_li
 
 # --- t16: a signed message goes out as Block Kit blocks + a `text` fallback --------------
 #
-# Measured 2026-10-10 (Masava self-DM): a `context` block renders the signature in the small
+# Measured 2026-10-10 (a real workspace, self-DM): a `context` block renders the signature in the small
 # grey font of Slack's own labels. With SLACK_SIGNATURE set every write sends `blocks` (the
 # text minus its signature line, then a context block with the signature as mrkdwn) plus
 # `text` = the whole signed text; without one, nothing changes.

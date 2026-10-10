@@ -14,7 +14,7 @@ from slack_mcp.errors import SlackApiError
 from slack_mcp.server import mcp
 from slack_mcp.tools.search import MAX_DISPLAY_ROWS, SearchMessagesInput, slack_search_messages
 
-PERMALINK = "https://udocz.slack.com/archives/C0123ABCDEF/p1712345678123456"
+PERMALINK = "https://acme.slack.com/archives/C0123ABCDEF/p1712345678123456"
 
 
 class _FakeClient:

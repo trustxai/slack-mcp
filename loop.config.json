@@ -48,13 +48,13 @@
     "architecture / strangler design",
     "cutover",
     "product decision",
-    "Slack app creation / scopes / install (one app per workspace: uDocz, Masava)",
+    "Slack app creation / scopes / install (one app per workspace)",
     "user token (xoxp) creation / rotation — never pasted into a session",
     "PyPI / OIDC trusted-publishing setup",
     "GitHub repo creation + branch protection",
     "release cut",
     "live smoke against the real workspaces (writes only in the user's own self-DM)",
-    "alejlatorre-mcps swap of slack-udocz + slack-masava + hot deploy with live sessions",
+    "alejlatorre-mcps swap of the two workspace entries + hot deploy with live sessions",
     "first real send as the user (group DM with a teammate) — explicit OK per message"
   ],
   "reversibility_triggers": [
