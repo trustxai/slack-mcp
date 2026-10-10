@@ -456,16 +456,17 @@ For example, the author's app in the Masava workspace is
 
 In a shell, quote the value (`*`, `<`, `>` and `|` are shell metacharacters); in a
 client's JSON `env` block it is an ordinary string. Either line only looks like Slack's
-label: it is message content, a marker and not provenance — anyone can post the same
-block by hand. How it behaves:
+label: it is message content, a marker and not provenance — anyone can type the same
+line, and any app can post the same block. How it behaves:
 
 - With a signature set, `slack_post_message`, `slack_reply_in_thread`,
   `slack_schedule_message` and `slack_update_message` send Block Kit `blocks` plus a
   `text` fallback, in both formats. Without one, nothing changes: plain `text` (mrkdwn)
   or `markdown_text` (Markdown), no blocks. The blocks are:
   - `format: "mrkdwn"`: the text in one or more `section` blocks, cut at line boundaries
-    into pieces of at most 3,000 characters (Slack's limit for a section's text; a single
-    longer line is cut at 3,000);
+    into pieces of at most 3,000 characters (Slack's limit for a section's text). A single
+    longer line is cut at a space, never inside a `<@U…>` mention or `<url|label>` link,
+    and hard at 3,000 only when there is no such point;
   - `format: "markdown"`: the text in one `markdown` block (at most 12,000 characters),
     and no `markdown_text`, which Slack does not accept next to `blocks`;
   - then a `context` block with the signature as mrkdwn — so write it in mrkdwn

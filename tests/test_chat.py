@@ -1013,6 +1013,7 @@ async def test_without_a_signature_every_tool_sends_plain_text_and_no_blocks(
     assert fake.calls[0] == _expected_wire(tool, {key: "Deploy done"}, when)
     assert "blocks" not in fake.calls[0][1]
     assert "- **signature**: not configured" in result
+    assert "(edited)" not in result  # the blocks note is only for an edit sent with blocks
 
 
 @pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
@@ -1146,6 +1147,26 @@ async def test_update_always_resends_blocks_and_text(monkeypatch: pytest.MonkeyP
         ("chat.update", {"channel": CHANNEL, "ts": TS, **_message("Deploy done (v2)", fmt, MENTION_SIG)})
     ]
     assert "- **signature**: appended (context block)" in result
+    assert (
+        '- **note**: sent with Block Kit blocks — Slack does not show its "(edited)" mark on an edit made with blocks'
+        in result
+    )
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+async def test_a_text_ending_with_the_signature_twice_keeps_one(monkeypatch: pytest.MonkeyPatch, fmt: Any) -> None:
+    settings = Settings(slack_signature=SIG)
+    for doubled in (f"hello\n\n{SIG}\n\n{SIG}", f"hello\n{SIG_MD}\n{SIG}", f"hello\n\n{SIG}\n\n{SIG_MD}\n\n{SIG}"):
+        assert _sign(doubled, settings, fmt) == (_signed("hello", fmt), False), repr(doubled)
+    assert _sign(f"{SIG}\n\n{SIG}", settings, fmt) == (SIGNATURES[fmt], False)  # nothing but signatures
+
+    _sign_with(monkeypatch, BOLD_SIG)
+    fake = _FakeClient(routes=_ALL_ROUTES)
+    _patch(monkeypatch, fake)
+    await slack_update_message(
+        UpdateMessageInput(channel=CHANNEL, ts=TS, text=f"hello\n\n{BOLD_SIG}\n\n{BOLD_SIG}", format=fmt)
+    )
+    assert fake.calls[0][1] == {"channel": CHANNEL, "ts": TS, **_message("hello", fmt, BOLD_SIG)}
 
 
 @pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
@@ -1267,6 +1288,32 @@ def test_section_chunks_hard_split_a_line_longer_than_3000() -> None:
     chunks = _section_chunks(f"intro\n{long_line}\noutro")
     assert chunks == ["intro", long_line[:3_000], long_line[3_000:6_000], long_line[6_000:] + "\noutro"]
     assert "".join(chunks[1:]).replace("\noutro", "") == long_line  # nothing lost
+    assert _section_chunks("q" * 3_500) == ["q" * 3_000, "q" * 500]  # no whitespace at all: still splits
+
+
+def test_a_long_line_is_cut_at_a_space_in_the_second_half_of_the_window() -> None:
+    words = " ".join(["abcd"] * 700)  # 3,499 characters, a space every 5
+    chunks = _section_chunks(words)
+    assert chunks == [" ".join(["abcd"] * 600), " ".join(["abcd"] * 100)]  # cut at the space at 2,999
+    assert " ".join(chunks) == words  # only that one space is dropped
+    # A short spaced prefix before a long unbroken run is not a tiny section of its own.
+    probe = "O-2 probe (chat.postMessage, 4001 chars): " + "0123456789" * 397
+    assert [len(chunk) for chunk in _section_chunks(probe)] == [3_000, len(probe) - 3_000]
+
+
+def test_a_mention_or_a_link_across_the_cut_stays_whole() -> None:
+    mention = "<@U0ANA000001>"
+    line = "x" * 2_996 + mention + " tail"  # no space before the mention; the window ends inside it
+    assert _section_chunks(line) == ["x" * 2_996, f"{mention} tail"]
+
+    link = "<https://example.com/path|a label with spaces>"  # its label has spaces inside the window
+    line = "y" * 2_969 + " " + link + " end"
+    assert _section_chunks(line) == ["y" * 2_969, f"{link} end"]  # cut before the link and its space
+
+    huge = "<https://example.com/" + "p" * 3_500 + "|x>"  # one entity longer than a section: hard cut
+    chunks = _section_chunks(huge)
+    assert chunks == [huge[:3_000], huge[3_000:]]
+    assert "".join(chunks) == huge
 
 
 def test_section_chunks_drop_blank_edges_and_empty_pieces() -> None:
@@ -1274,6 +1321,8 @@ def test_section_chunks_drop_blank_edges_and_empty_pieces() -> None:
     second = "b" * 2_000
     # The blank line between them lands at the cut: no section starts or ends with it.
     assert _section_chunks(f"{first}\n\n{second}") == [first, second]
+    assert _section_chunks(f"{first}\n  \n{second}") == [first, second]  # whitespace-only, too
+    assert _section_chunks("  \nabc\n \t") == ["abc"]
     assert _section_chunks("") == []
     assert _section_chunks("\n \n") == []
 

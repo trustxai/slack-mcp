@@ -152,18 +152,23 @@ def _is_signature_line(line: str, signature: str) -> bool:
 
 
 def _unsigned(text: str, signature: str) -> tuple[str, bool]:
-    """`(text without its trailing signature line, had one?)`.
+    """`(text without its trailing signature lines, had one?)`.
 
     "Trailing signature line" means the LAST line, trailing whitespace ignored, is the
     signature in either form (`_is_signature_line`, entities decoded); it is cut together
-    with the blank lines before it. Otherwise the text comes back right-trimmed. A
-    signature quoted in the middle of the text is not a trailing line and stays.
+    with the blank lines before it, and again while the new last line is one too — so a
+    text that somehow ends with the signature twice comes back with none. Otherwise the
+    text comes back right-trimmed. A signature quoted in the middle of the text is not a
+    trailing line and stays.
     """
     body = text.rstrip()
-    head, _, last = body.rpartition("\n")
-    if _is_signature_line(last, signature):
-        return head.rstrip(), True
-    return body, False
+    had_signature = False
+    while body:
+        head, _, last = body.rpartition("\n")
+        if not _is_signature_line(last, signature):
+            break
+        body, had_signature = head.rstrip(), True
+    return body, had_signature
 
 
 def _sign(text: str, settings: Settings, fmt: MessageFormat = "mrkdwn") -> tuple[str, bool]:
@@ -197,13 +202,46 @@ class BlockLimitError(RuntimeError):
     """The signed message does not fit Slack's Block Kit limits; nothing is sent."""
 
 
+def _line_cut(line: str, size: int) -> tuple[int, int]:
+    """`(end, skip)` to split a line longer than `size`: `line[:end]`, then `line[end + skip:]`.
+
+    Backs off to the last space or tab in the second half of the window (dropped, like the
+    newline at a line cut; the first half is not searched, so a short spaced prefix before
+    a long unbroken run does not become a tiny section), and never cuts between an
+    unclosed `<` and its `>` — a `<@U…>` mention or a `<url|label>` link stays whole,
+    moving to the next piece. Only when no such point exists (one word, or one entity,
+    longer than that) is the line hard-cut at `size`.
+    """
+    end, skip = size, 0
+    floor = max(1, size // 2)
+    space = max(line.rfind(" ", floor, size + 1), line.rfind("\t", floor, size + 1))
+    if space > 0:
+        end, skip = space, 1
+    opening = line.rfind("<", 0, end)
+    if opening > line.rfind(">", 0, end):
+        kept = len(line[:opening].rstrip(" \t"))  # cut before the entity, and before the spaces in front of it
+        return (kept, opening - kept) if kept > 0 else (size, 0)
+    return end, skip
+
+
+def _trim_blank_edges(piece: str) -> str:
+    """`piece` without its leading and trailing whitespace-only lines."""
+    lines = piece.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
 def _section_chunks(body: str, size: int = SECTION_TEXT_MAX) -> list[str]:
     """`body` cut at line boundaries into pieces of at most `size` characters, in order.
 
-    Lines are packed greedily; a single line longer than `size` is hard-split into
-    `size`-character pieces. The newline at a cut is dropped (each piece is its own
-    section block), as are blank lines at a piece's edges and pieces with nothing but
-    whitespace — a section's text must hold at least one character.
+    Lines are packed greedily; a single line longer than `size` is split by `_line_cut`
+    (at a space, never inside a `<…>` entity, hard only as a last resort). The newline at
+    a cut is dropped (each piece is its own section block), as are whitespace-only lines
+    at a piece's edges and pieces with nothing but whitespace — a section's text must
+    hold at least one character.
     """
     pieces: list[str] = []
     current: str | None = None
@@ -213,8 +251,9 @@ def _section_chunks(body: str, size: int = SECTION_TEXT_MAX) -> list[str]:
             if current is not None:
                 pieces.append(current)
                 current = None
-            pieces.append(line[:size])
-            line = line[size:]
+            end, skip = _line_cut(line, size)
+            pieces.append(line[:end])
+            line = line[end + skip :]
         if current is None:
             current = line
         elif len(current) + 1 + len(line) <= size:
@@ -224,7 +263,8 @@ def _section_chunks(body: str, size: int = SECTION_TEXT_MAX) -> list[str]:
             current = line
     if current is not None:
         pieces.append(current)
-    return [piece.strip("\n") for piece in pieces if piece.strip()]
+    trimmed = (_trim_blank_edges(piece) for piece in pieces)
+    return [piece for piece in trimmed if piece]
 
 
 def _build_message(text: str, fmt: MessageFormat, settings: Settings) -> dict[str, Any]:
@@ -715,6 +755,9 @@ async def slack_reply_in_thread(params: ReplyInThreadInput) -> str:
       `missing_scope` (needs the `chat:write` user scope).
     - `Error: text is N characters including the …-character signature …`: the signature pushed the
       text over the limit; nothing was sent — shorten the text.
+    - `Error: … Slack allows at most 50 blocks per message …` / `Error: SLACK_SIGNATURE is N characters …
+      context block …`: the signed reply does not fit Block Kit's limits; nothing was sent.
+      `invalid_blocks` / `msg_blocks_too_long` are Slack refusing the blocks.
     - A timeout or 5xx means the execution status is UNKNOWN: read the thread back with
       `slack_get_thread` before replying again.
     """
@@ -746,8 +789,11 @@ async def slack_reply_in_thread(params: ReplyInThreadInput) -> str:
 async def slack_update_message(params: UpdateMessageInput) -> str:
     """Edit one of your own Slack messages as you — a SLACK_SIGNATURE line, if set, stays exactly once.
 
-    Calls `chat.update` once with your user token: the new `text` replaces the old text
-    entirely (and removes any blocks the message had). Only messages you posted can be
+    Calls `chat.update` once with your user token: the new text replaces the old text
+    entirely. Slack documents that an edit sending `text` without `blocks` removes the
+    blocks the message had (so a signed message edited with SLACK_SIGNATURE unset loses
+    its context block); what a `markdown_text`-only edit does to a message with blocks is
+    not measured. Only messages you posted can be
     edited — Slack refuses anyone else's with `cant_update_message`. The message stays
     posted as you. Slack does not label these messages: they look exactly like ones you
     typed. To let teammates tell them apart, set `SLACK_SIGNATURE` — the server keeps it
@@ -757,8 +803,9 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
     changed — stays signed exactly once. With a signature the edit always resends the
     `blocks` too (the text without its signature line, then the signature's `context`
     block), replacing the old ones; Slack does not show its "edited" mark on an edit made
-    with blocks. `format` works as in
-    `slack_post_message` (`mrkdwn` → `text`, `markdown` → `markdown_text`). The text
+    with blocks. `format` works as in `slack_post_message`: unsigned, `mrkdwn` → `text`
+    and `markdown` → `markdown_text`; signed, both send `text` + `blocks` (sections, or one
+    `markdown` block). The text
     (signature included) is capped at 4,000 characters locally because `chat.update`
     refuses longer text with `msg_too_long` (unlike `chat.postMessage`, which accepts up
     to 40,000).
@@ -781,7 +828,8 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
     Returns:
     A confirmation echoing only what Slack returned: `channel`, `ts`, the stored `text`,
     and any Slack warning — plus a `signature` line (appended / already the last line /
-    not configured) — or an `Error ...` string.
+    not configured) and, for an edit sent with blocks, a note that Slack hides its
+    "edited" mark on it — or an `Error ...` string.
 
     Examples:
     - `params = {"channel": "C0123ABCDEF", "ts": "1712345678.123456", "text": "Deploy done (v2) :rocket:"}`
@@ -795,6 +843,7 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
     - `Error: text is N characters including the …-character signature …`: the signature pushed the
       text over 4,000; nothing was sent — shorten the text. `Error: SLACK_SIGNATURE is N characters
       … context block …`: the signature itself is too long for a context block; nothing was sent.
+      `invalid_blocks` / `msg_blocks_too_long` are Slack refusing the blocks.
     """
     try:
         message, signature_line = _prepare_message(
@@ -813,6 +862,11 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
             f"- **text** (as Slack stored it):\n{text}" if text else "- **text**: Slack returned none",
             signature_line,
         ]
+        if "blocks" in wire:
+            lines.append(
+                '- **note**: sent with Block Kit blocks — Slack does not show its "(edited)" mark on an edit made '
+                "with blocks"
+            )
         warnings = fmt_warnings(body)
         if warnings:
             lines.append(warnings)

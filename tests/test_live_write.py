@@ -60,6 +60,7 @@ from slack_mcp.tools.chat import (
     ReplyInThreadInput,
     ScheduleMessageInput,
     UpdateMessageInput,
+    _section_chunks,
     slack_post_message,
     slack_reply_in_thread,
     slack_schedule_message,
@@ -325,7 +326,8 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
                 f"step 9 signature: the stored {label} ({ts}) does not carry exactly one context block with "
                 f"SLACK_SIGNATURE {signature!r}; its blocks: {json.dumps(blocks)[:1500]}"
             )
-            others = json.dumps([block for block in blocks if block.get("type") != "context"])
+            # ensure_ascii=False: a non-ASCII signature must not be vacuously absent from `\uXXXX` escapes.
+            others = json.dumps([block for block in blocks if block.get("type") != "context"], ensure_ascii=False)
             assert plain_signature not in html.unescape(others), (
                 f"step 9 signature: the stored {label} ({ts}) repeats the signature inside a body block: {others[:1500]}"
             )
@@ -365,12 +367,21 @@ async def test_2_length_limits_o2(live_stack: SlackClient) -> None:
     client, dm, parent = live_stack, _RUN["dm"], _RUN["md_ts"]
     outcomes: list[str] = []
 
-    long_post = await slack_reply_in_thread(
-        ReplyInThreadInput(channel=dm, thread_ts=parent, text=_sized("chat.postMessage", 4_001))
-    )
+    probe = _sized("chat.postMessage", 4_001)
+    long_post = await slack_reply_in_thread(ReplyInThreadInput(channel=dm, thread_ts=parent, text=probe))
     long_ts = _field(long_post, "ts") if "SENT" in long_post else ""
-    outcomes.append(f"chat.postMessage 4,001 chars: {'ok' if long_ts else long_post.splitlines()[0]}")
-    assert long_ts or long_post.startswith("Error"), f"O-2 postMessage probe: neither SENT nor an error:\n{long_post}"
+    if get_settings().signature:
+        # t16: signed, this 4,001-character body goes out as 2 section blocks (3,000 + 1,001)
+        # plus the context block — the live proof that Slack accepts a multi-section message.
+        sections = len(_section_chunks(probe))
+        assert sections == 2, f"O-2 setup: the probe should need 2 section blocks, it needs {sections}"
+        assert long_ts, f"O-2 signed postMessage probe: the {sections}-section message was not SENT:\n{long_post}"
+        outcomes.append(f"chat.postMessage 4,001 chars: ok (signed: {sections} sections + context block)")
+    else:
+        outcomes.append(f"chat.postMessage 4,001 chars: {'ok' if long_ts else long_post.splitlines()[0]}")
+        assert long_ts or long_post.startswith("Error"), (
+            f"O-2 postMessage probe: neither SENT nor an error:\n{long_post}"
+        )
 
     if long_ts:
         for size in (4_000, 4_001):

@@ -14,10 +14,11 @@ safely.
   teammates tell them apart, set `SLACK_SIGNATURE` — the server then shows it under every
   message it posts, in a Block Kit `context` block (the small grey font of Slack's own
   labels), ends the plain-text fallback with it, and keeps it on edits. It is message
-  content, so anyone can post the same block by hand: it tells teammates which messages
-  came from the server, it does not prove it. The recommended value,
-  `*Sent using* <@U0BOTID>`, mentions a bot user the app gets only to be mentionable; that
-  bot user's token (`xoxb-…`) is never used, and the server refuses it like any bot token.
+  content — anyone can type the same line, and any app can post the same block — so it
+  tells teammates which messages came from the server, it does not prove it. The
+  recommended value, `*Sent using* <@U0BOTID>`, mentions a bot user the app gets only to
+  be mentionable; that bot user's token (`xoxb-…`) is never used, and the server refuses
+  it like any bot token.
 - Bot tokens (`xoxb-…`), app-level tokens (`xapp-…`), browser session tokens
   (`xoxc-…` / `xoxd-…`) and refresh tokens are refused before any request is sent.
 - Writes are off unless `SLACK_ALLOW_WRITES=1`, and even then a write must target a
