@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/trustxai/slack-mcp/compare/v0.1.0...v0.1.1) (2026-10-10)
+
+
+### Bug Fixes
+
+* generic placeholders instead of real workspace and client identifiers ([59ca0d8](https://github.com/trustxai/slack-mcp/commit/59ca0d89906ccef1eb89049dff7b5432b79cfc7e))
+
 ## 0.1.0 (2026-10-10)
 
 
