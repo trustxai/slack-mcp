@@ -31,7 +31,10 @@ STORED IT (read back with `slack_get_thread`, so a signed post comes back signed
 entity-encoded), which is the edit flow that must not double-sign. When the signature is
 set for the run (shell or .env), step 9 asserts that the post (after that edit) and the
 thread reply end with the signature line after a blank line, and that it appears exactly
-twice in the thread (once each); unset, that check is skipped and the result block says so.
+twice in the thread (once each), on the `text` read-back; and, in JSON mode (the raw
+messages), that both carry a Block Kit `context` block holding the signature (t16) while
+no other block of theirs contains it. Unset, that check is skipped and the result block
+says so.
 """
 
 from __future__ import annotations
@@ -303,13 +306,46 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
             f"step 9 signature: expected it exactly twice (post + reply), found "
             f"{plain_thread.count(plain_signature)} — the edit from the read-back text double-signed?\n{thread}"
         )
+        # t16: the stored messages carry the signature in a `context` block (the raw `blocks`,
+        # read in JSON mode), and no other block of theirs repeats it — the edit resent them.
+        raw_thread = await slack_get_thread(
+            GetThreadInput(channel=dm, thread_ts=ts1, limit=20, response_format=ResponseFormat.JSON)
+        )
+        raw_items = {str(item.get("ts")): item for item in json.loads(raw_thread).get("items") or []}
+        for label, ts in (("post, after its edit", ts1), ("thread reply", reply_ts)):
+            blocks = [block for block in raw_items.get(ts, {}).get("blocks") or [] if isinstance(block, dict)]
+            contexts = [block for block in blocks if block.get("type") == "context"]
+            context_text = " ".join(
+                html.unescape(str(element.get("text") or ""))
+                for block in contexts
+                for element in block.get("elements") or []
+                if isinstance(element, dict)
+            )
+            assert len(contexts) == 1 and plain_signature in context_text, (
+                f"step 9 signature: the stored {label} ({ts}) does not carry exactly one context block with "
+                f"SLACK_SIGNATURE {signature!r}; its blocks: {json.dumps(blocks)[:1500]}"
+            )
+            others = json.dumps([block for block in blocks if block.get("type") != "context"])
+            assert plain_signature not in html.unescape(others), (
+                f"step 9 signature: the stored {label} ({ts}) repeats the signature inside a body block: {others[:1500]}"
+            )
         # The markdown post is not asserted — how Slack stores markdown_text is not measured
         # yet — only recorded, to compare by eye with its permalink.
         md_thread = await slack_get_thread(GetThreadInput(channel=dm, thread_ts=_RUN["md_ts"], limit=1))
+        md_raw = await slack_get_thread(
+            GetThreadInput(channel=dm, thread_ts=_RUN["md_ts"], limit=1, response_format=ResponseFormat.JSON)
+        )
+        md_items = json.loads(md_raw).get("items") or []
+        md_block_types = [
+            str(block.get("type"))
+            for item in md_items[:1]
+            for block in item.get("blocks") or []
+            if isinstance(block, dict)
+        ]
         _RUN["signature"] = (
             f"on ({len(signature)} chars) — verified as the last line, after a blank line, of the post (after its "
-            f"edit) and of the reply; the markdown post's last line reads back as: "
-            f"{_line(md_thread, '(ts ' + _RUN['md_ts'] + ')')!r}"
+            f"edit) and of the reply, and as their one context block; the markdown post's last line reads back as: "
+            f"{_line(md_thread, '(ts ' + _RUN['md_ts'] + ')')!r}, its stored block types: {md_block_types}"
         )
     else:
         _RUN["signature"] = "off (SLACK_SIGNATURE unset for this run) — the signature check was skipped"
