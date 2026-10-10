@@ -976,8 +976,9 @@ async def slack_open_conversation(params: OpenConversationInput) -> str:
     ID): here every id in `users` must be listed in `SLACK_WRITE_USERS` (your own id
     always passes). The client's write guard checks that before anything is sent. It runs
     AS YOU — the conversation is opened under your account, and a message you then post
-    there goes out as you, with Slack's "Sent using @Alejandro AI" line. Never retried
-    automatically.
+    there goes out as you. Slack does not label these messages: they look exactly like
+    ones you typed. To let teammates tell them apart, set `SLACK_SIGNATURE` — the server
+    appends it as the last line of every message it posts. Never retried automatically.
 
     When to Use:
     - To message someone (or a small group) privately: open first, then post to the id.
@@ -1039,7 +1040,7 @@ async def slack_open_conversation(params: OpenConversationInput) -> str:
             lines.append(f"- {warnings}")
         lines.append(
             f"- **next step**: post with slack_post_message(channel={cid!r}, …) — never to a U… id. That message goes "
-            'out as you, with Slack\'s "Sent using @Alejandro AI" line.'
+            "out as you, unlabeled by Slack (SLACK_SIGNATURE, if set, is appended as its last line)."
         )
         return clip_response("\n".join(lines))
     except Exception as exc:

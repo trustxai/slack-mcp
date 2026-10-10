@@ -214,3 +214,45 @@ def test_token_type_error_is_a_runtime_error() -> None:
 
 def test_get_settings_is_cached() -> None:
     assert get_settings() is get_settings()
+
+
+# --- SLACK_SIGNATURE -------------------------------------------------------------------
+
+SIGNATURE = "Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>"
+
+
+def test_signature_is_off_by_default() -> None:
+    settings = Settings()
+    assert settings.slack_signature == ""
+    assert settings.signature is None
+
+
+def test_signature_from_the_env_is_whitespace_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SLACK_SIGNATURE", f"  {SIGNATURE} \n")
+    get_settings.cache_clear()
+    assert get_settings().signature == SIGNATURE
+    assert get_settings().slack_signature == SIGNATURE
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\n", " \r\n\t "])
+def test_a_blank_signature_is_off(value: str) -> None:
+    assert Settings(slack_signature=value).signature is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("— enviado con\nAlejandro AI", "— enviado con Alejandro AI"),
+        (
+            "  Sent using\r\n   <https://x.slack.com/marketplace/A1|@App>  \n\n",
+            "Sent using <https://x.slack.com/marketplace/A1|@App>",
+        ),
+        ("one\n\n\ntwo\nthree", "one two three"),
+        ("keeps  inner   spaces", "keeps  inner   spaces"),
+    ],
+)
+def test_a_multi_line_signature_is_collapsed_to_one_line(value: str, expected: str) -> None:
+    settings = Settings(slack_signature=value)
+    assert settings.signature == expected
+    assert "\n" not in settings.slack_signature
+    assert "\r" not in settings.slack_signature

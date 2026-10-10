@@ -853,7 +853,7 @@ async def test_open_dm_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
             "- **requested**: users U0ANA000001",
             "- **already_open**: not reported by Slack",
             "- **next step**: post with slack_post_message(channel='D0123ABCDEF', …) — never to a U… id. That "
-            'message goes out as you, with Slack\'s "Sent using @Alejandro AI" line.',
+            "message goes out as you, unlabeled by Slack (SLACK_SIGNATURE, if set, is appended as its last line).",
         ]
     )
 
@@ -1111,7 +1111,8 @@ async def test_the_write_docstring_states_the_gate_and_the_identity() -> None:
         "`SLACK_WRITE_USERS` (Slack Connect channels only by explicit ID)"
     ) in description
     assert "AS YOU" in description
-    assert '"Sent using @Alejandro AI" line' in description
+    assert "Slack does not label these messages: they look exactly like ones you typed." in description
+    assert "set `SLACK_SIGNATURE` — the server appends it as the last line of every message it posts" in description
     assert "Never retried automatically." in description
     assert "never post to a `U…` user id directly" in description
     assert "Do not include your own id, except alone: `users = [<your id>]` opens your self-DM" in description

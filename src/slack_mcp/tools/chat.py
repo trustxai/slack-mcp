@@ -1,9 +1,12 @@
 """Slack `chat` tools: post, reply in a thread, edit, and schedule messages — AS YOU.
 
 Every tool here writes with the user token, so Slack shows the message under your own
-name and avatar, with Slack's "Sent using @Alejandro AI" line. The tools never gate,
-never retry and never pick an encoding: `client.call()` runs the write guard on the
-exact parameters that go on the wire (kill-switch, ID-only channel allowlist, DM
+name and avatar. Slack does not label these messages: they look exactly like ones you
+typed (measured 2026-10-10 with an internal app, in a self-DM and in a public channel).
+To let teammates tell them apart, set `SLACK_SIGNATURE` — `_sign` appends it as the last
+line of every message these tools post, reply, schedule or edit, never twice. The tools
+never gate, never retry and never pick an encoding: `client.call()` runs the write guard
+on the exact parameters that go on the wire (kill-switch, ID-only channel allowlist, DM
 membership, Slack Connect refusal), sends `chat.postMessage` / `chat.update` /
 `chat.scheduleMessage` as JSON, and refuses to retry a write.
 
@@ -12,11 +15,12 @@ Two facts from research 02 shape the inputs: `chat.postMessage` truncates `text`
 confirmation renders `fmt_warnings`), and `chat.update` errors with `msg_too_long` past
 4,000 characters (so the update tool refuses that locally). `format="markdown"` sends
 the same string as `markdown_text` — real Markdown, at most 12,000 characters, never
-combined with `text`.
+combined with `text`. Every cap applies to the FINAL text, signature included.
 """
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Literal, Self
 
@@ -25,6 +29,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from slack_mcp.client import SlackClient, get_client
+from slack_mcp.config import Settings, get_settings
 from slack_mcp.errors import SlackApiError, handle_api_error, hint_for
 from slack_mcp.formatters import clip_response, fmt_warnings, ts_to_human
 from slack_mcp.server import mcp
@@ -84,6 +89,80 @@ def _text_field(fmt: MessageFormat, text: str) -> dict[str, str]:
     return {"markdown_text": text} if fmt == "markdown" else {"text": text}
 
 
+# -- the signature (SLACK_SIGNATURE) ---------------------------------------------
+
+# A mrkdwn link `<https://…|label>` (or mailto:). Mentions (`<@U…>`), channel links
+# (`<#C…|name>`) and specials (`<!here>`) do not match: they are not URLs.
+_MRKDWN_LINK = re.compile(r"<((?:https?|mailto):[^|<>\s]+)\|([^<>]+)>")
+
+
+def _markdown_label(label: str) -> str:
+    return label.replace("[", "\\[").replace("]", "\\]")
+
+
+def _signature_for(fmt: MessageFormat, signature: str) -> str:
+    """The signature as it is written for `fmt`.
+
+    `SLACK_SIGNATURE` is mrkdwn; `markdown_text` is standard Markdown, where `<url|label>`
+    would render literally, so for `format="markdown"` each such link becomes
+    `[label](url)`. A bare `<url>` is already a Markdown autolink and stays as it is.
+    """
+    if fmt != "markdown":
+        return signature
+    return _MRKDWN_LINK.sub(lambda m: f"[{_markdown_label(m.group(2))}]({m.group(1)})", signature)
+
+
+def _sign(text: str, settings: Settings, fmt: MessageFormat = "mrkdwn") -> tuple[str, bool]:
+    """`(text to send, appended?)` — `text + "\\n" + signature` unless it already ends with it.
+
+    "Already ends with it" means the LAST line (whitespace-trimmed) equals the signature as
+    written for `fmt`: re-sending a signed text (an edit of a signed message) keeps exactly
+    one signature, while a signature quoted in the middle of the text is signed again at
+    the end. No signature configured → the text unchanged.
+    """
+    if settings.signature is None:
+        return text, False
+    signature = _signature_for(fmt, settings.signature)
+    if text.rsplit("\n", 1)[-1].strip() == signature:
+        return text, False
+    return f"{text}\n{signature}", True
+
+
+class SignedTextTooLongError(RuntimeError):
+    """The text plus its signature exceeds the cap for the method / format; nothing is sent."""
+
+
+def _prepare_text(text: str, fmt: MessageFormat, limit: int, why: str) -> tuple[str, str]:
+    """`(final text, confirmation line)`: sign the text, then check `limit` on the FINAL text.
+
+    The input models already cap the text as typed; this catches the case where the
+    signature pushes it over. Raised before any Slack call, so nothing goes out.
+    """
+    settings = get_settings()
+    final, appended = _sign(text, settings, fmt)
+    if len(final) > limit:
+        signature = _signature_for(fmt, settings.signature or "")
+        included = f" including the {len(signature):,}-character signature (SLACK_SIGNATURE)" if appended else ""
+        raise SignedTextTooLongError(
+            f"text is {len(final):,} characters{included}; the limit is {limit:,}{why} — shorten the text by at "
+            f"least {len(final) - limit:,} characters. Nothing was sent."
+        )
+    if appended:
+        line = "- **signature**: appended"
+    elif settings.signature is not None:
+        line = "- **signature**: already the last line of the text — not added again"
+    else:
+        line = "- **signature**: not configured"
+    return final, line
+
+
+def _post_limit(fmt: MessageFormat) -> tuple[int, str]:
+    """`(cap, why)` for chat.postMessage / chat.scheduleMessage text in `fmt`."""
+    if fmt == "markdown":
+        return MARKDOWN_TEXT_MAX, " for format='markdown' (Slack's markdown_text limit)"
+    return POST_TEXT_MAX, " (Slack truncates longer text)"
+
+
 # -- input models ----------------------------------------------------------------
 
 
@@ -99,7 +178,8 @@ class PostMessageInput(BaseModel):
         max_length=POST_TEXT_MAX,
         description=(
             "The message, sent verbatim. Keep it under ~4,000 characters for readability; Slack truncates past "
-            "40,000 (and at most 12,000 with format='markdown')."
+            "40,000 (and at most 12,000 with format='markdown'). If SLACK_SIGNATURE is set it is appended as the last "
+            "line and counts toward these limits."
         ),
     )
     format: MessageFormat = Field(default="mrkdwn", description=_FORMAT_DESCRIPTION)
@@ -146,7 +226,10 @@ class ReplyInThreadInput(BaseModel):
         ...,
         min_length=1,
         max_length=POST_TEXT_MAX,
-        description="The reply, sent verbatim (Slack truncates past 40,000; at most 12,000 with format='markdown').",
+        description=(
+            "The reply, sent verbatim (Slack truncates past 40,000; at most 12,000 with format='markdown'). If "
+            "SLACK_SIGNATURE is set it is appended as the last line and counts toward these limits."
+        ),
     )
     format: MessageFormat = Field(default="mrkdwn", description=_FORMAT_DESCRIPTION)
     reply_broadcast: bool = Field(
@@ -185,7 +268,11 @@ class UpdateMessageInput(BaseModel):
         ...,
         min_length=1,
         max_length=UPDATE_TEXT_MAX,
-        description="The new text, replacing the old one entirely. At most 4,000 characters (chat.update's limit).",
+        description=(
+            "The new text, replacing the old one entirely. At most 4,000 characters (chat.update's limit). If "
+            "SLACK_SIGNATURE is set it stays the last line (appended unless this text already ends with it) and "
+            "counts toward the limit."
+        ),
     )
     format: MessageFormat = Field(default="mrkdwn", description=_FORMAT_DESCRIPTION)
 
@@ -217,7 +304,10 @@ class ScheduleMessageInput(BaseModel):
         ...,
         min_length=1,
         max_length=POST_TEXT_MAX,
-        description="The message, sent verbatim (at most 12,000 characters with format='markdown').",
+        description=(
+            "The message, sent verbatim (at most 12,000 characters with format='markdown'). If SLACK_SIGNATURE is "
+            "set it is appended as the last line and counts toward the limits."
+        ),
     )
     format: MessageFormat = Field(default="mrkdwn", description=_FORMAT_DESCRIPTION)
     thread_ts: str | None = Field(
@@ -291,7 +381,7 @@ async def _permalink_line(client: SlackClient, channel: str, ts: str) -> str:
     return f"- **permalink**: {link}" if link else "- **permalink**: Slack returned none"
 
 
-async def _post_and_confirm(wire: dict[str, Any], *, heading: str) -> str:
+async def _post_and_confirm(wire: dict[str, Any], *, heading: str, signature_line: str) -> str:
     """Send ONE chat.postMessage (no retry) and render what Slack returned, plus the permalink.
 
     If the post raises, the exception goes to the caller's handler (not sent / status
@@ -316,6 +406,7 @@ async def _post_and_confirm(wire: dict[str, Any], *, heading: str) -> str:
     if thread_ts and str(thread_ts) != ts:
         lines.append(f"- **thread_ts**: {thread_ts} (the thread's parent — use it for further replies)")
     lines.append(await _permalink_line(client, channel or str(wire.get("channel") or ""), ts))
+    lines.append(signature_line)
     warnings = fmt_warnings(body)
     if warnings:
         lines.append(warnings)
@@ -336,10 +427,13 @@ async def _post_and_confirm(wire: dict[str, Any], *, heading: str) -> str:
     ),
 )
 async def slack_post_message(params: PostMessageInput) -> str:
-    """Post a message to a Slack channel, DM or group DM — posted as you, with Slack's "Sent using @Alejandro AI" line.
+    """Post a message to a Slack channel, DM or group DM as you — Slack adds no label; SLACK_SIGNATURE signs it if set.
 
     Calls `chat.postMessage` once with your user token, so the message shows your name
-    and avatar plus Slack's "Sent using @Alejandro AI" line — there is no bot identity.
+    and avatar — there is no bot identity. Slack does not label these messages: they look
+    exactly like ones you typed. To let teammates tell them apart, set `SLACK_SIGNATURE` —
+    the server appends it as the last line of every message it posts (not again if the
+    text already ends with it; it counts toward the length limits below).
     The text goes out verbatim. With `format="mrkdwn"` (default) it is sent as `text` in
     Slack's own syntax: `*bold*` (single asterisks), `_italic_`, `` `code` ``,
     `<@U0123ABCDEF>` to mention someone (an id, never a name), `<https://x.y|label>` for a
@@ -367,9 +461,10 @@ async def slack_post_message(params: PostMessageInput) -> str:
     Returns:
     A confirmation echoing only what Slack returned: `channel`, `ts` (with its UTC time),
     the permalink, and any Slack warning (e.g. `message_truncated` when Slack cut text past
-    40,000 characters — the message was still posted). If the permalink lookup fails the
-    message is still reported as SENT, with the lookup error. On failure, an `Error ...`
-    string; nothing was posted unless it says the status is UNKNOWN.
+    40,000 characters — the message was still posted) — plus a `signature` line saying
+    whether SLACK_SIGNATURE was appended. If the permalink lookup fails the message is
+    still reported as SENT, with the lookup error. On failure, an `Error ...` string;
+    nothing was posted unless it says the status is UNKNOWN.
 
     Examples:
     - `params = {"channel": "C0123ABCDEF", "text": "Deploy done :white_check_mark: <@U0ANA000001>"}`
@@ -382,19 +477,22 @@ async def slack_post_message(params: PostMessageInput) -> str:
     - `channel_not_found` (wrong id / no access), `is_archived`, `restricted_action*` (channel policy),
       `rate_limited` (about 1 message per second per channel), `missing_scope` (needs the `chat:write`
       user scope).
+    - `Error: text is N characters including the …-character signature …`: the signature pushed the
+      text over the limit; nothing was sent — shorten the text.
     - A timeout or 5xx means the execution status is UNKNOWN: read the conversation back with
       `slack_get_history` before posting again.
     """
     try:
+        text, signature_line = _prepare_text(params.text, params.format, *_post_limit(params.format))
         wire: dict[str, Any] = {
             "channel": params.channel,
-            **_text_field(params.format, params.text),
+            **_text_field(params.format, text),
             "unfurl_links": params.unfurl_links,
             "unfurl_media": params.unfurl_media,
         }
         if params.thread_ts is not None:
             wire["thread_ts"] = params.thread_ts
-        return await _post_and_confirm(wire, heading="Message sent")
+        return await _post_and_confirm(wire, heading="Message sent", signature_line=signature_line)
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -410,11 +508,14 @@ async def slack_post_message(params: PostMessageInput) -> str:
     ),
 )
 async def slack_reply_in_thread(params: ReplyInThreadInput) -> str:
-    """Reply inside a Slack thread — posted as you, with Slack's "Sent using @Alejandro AI" line.
+    """Reply inside a Slack thread as you — Slack adds no label; SLACK_SIGNATURE signs it if set.
 
     Calls `chat.postMessage` once with `thread_ts` set to the thread's PARENT message, so
-    the reply lands in that thread under your name and avatar plus Slack's "Sent using
-    @Alejandro AI" line. `reply_broadcast=true` also shows it in the channel. Text and
+    the reply lands in that thread under your name and avatar. Slack does not label these
+    messages: they look exactly like ones you typed. To let teammates tell them apart, set
+    `SLACK_SIGNATURE` — the server appends it as the last line of every message it posts
+    (not again if the text already ends with it; it counts toward the length limits).
+    `reply_broadcast=true` also shows it in the channel. Text and
     `format` work exactly as in `slack_post_message` (`mrkdwn` → `text` with `*bold*`,
     `<@U…>` mentions and `<url|label>` links; `markdown` → `markdown_text`, ≤ 12,000
     characters). After a successful post the permalink is looked up with `chat.getPermalink`.
@@ -436,9 +537,10 @@ async def slack_reply_in_thread(params: ReplyInThreadInput) -> str:
 
     Returns:
     A confirmation echoing only what Slack returned: `channel`, `ts` of the reply, the
-    thread's parent `thread_ts`, the permalink, and any Slack warning. If the permalink
-    lookup fails the reply is still reported as SENT, with the lookup error. On failure,
-    an `Error ...` string; nothing was posted unless it says the status is UNKNOWN.
+    thread's parent `thread_ts`, the permalink, and any Slack warning — plus a `signature`
+    line saying whether SLACK_SIGNATURE was appended. If the permalink lookup fails the
+    reply is still reported as SENT, with the lookup error. On failure, an `Error ...`
+    string; nothing was posted unless it says the status is UNKNOWN.
 
     Examples:
     - `params = {"channel": "C0123ABCDEF", "thread_ts": "1712345678.123456", "text": "On it — ETA 3 pm"}`
@@ -451,19 +553,22 @@ async def slack_reply_in_thread(params: ReplyInThreadInput) -> str:
     - `not_in_channel` (join in Slack first), `channel_not_found`, `thread_not_found` / `cannot_reply_to_message`
       (wrong `thread_ts` — use the parent), `restricted_action_thread_locked`, `rate_limited`,
       `missing_scope` (needs the `chat:write` user scope).
+    - `Error: text is N characters including the …-character signature …`: the signature pushed the
+      text over the limit; nothing was sent — shorten the text.
     - A timeout or 5xx means the execution status is UNKNOWN: read the thread back with
       `slack_get_thread` before replying again.
     """
     try:
+        text, signature_line = _prepare_text(params.text, params.format, *_post_limit(params.format))
         wire: dict[str, Any] = {
             "channel": params.channel,
             "thread_ts": params.thread_ts,
-            **_text_field(params.format, params.text),
+            **_text_field(params.format, text),
             "reply_broadcast": params.reply_broadcast,
             "unfurl_links": params.unfurl_links,
             "unfurl_media": params.unfurl_media,
         }
-        return await _post_and_confirm(wire, heading="Reply sent")
+        return await _post_and_confirm(wire, heading="Reply sent", signature_line=signature_line)
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -479,15 +584,19 @@ async def slack_reply_in_thread(params: ReplyInThreadInput) -> str:
     ),
 )
 async def slack_update_message(params: UpdateMessageInput) -> str:
-    """Edit one of your own Slack messages — the edit is made as you, with Slack's "Sent using @Alejandro AI" line.
+    """Edit one of your own Slack messages as you — a SLACK_SIGNATURE line, if set, stays exactly once.
 
     Calls `chat.update` once with your user token: the new `text` replaces the old text
     entirely (and removes any blocks the message had). Only messages you posted can be
     edited — Slack refuses anyone else's with `cant_update_message`. The message stays
-    posted as you, with Slack's "Sent using @Alejandro AI" line. `format` works as in
-    `slack_post_message` (`mrkdwn` → `text`, `markdown` → `markdown_text`). The text is
-    capped at 4,000 characters locally because `chat.update` refuses longer text with
-    `msg_too_long` (unlike `chat.postMessage`, which accepts up to 40,000).
+    posted as you. Slack does not label these messages: they look exactly like ones you
+    typed. To let teammates tell them apart, set `SLACK_SIGNATURE` — the server keeps it
+    as the last line of the edited text: appended unless the new text already ends with
+    it, so an edit of a signed message stays signed exactly once. `format` works as in
+    `slack_post_message` (`mrkdwn` → `text`, `markdown` → `markdown_text`). The text
+    (signature included) is capped at 4,000 characters locally because `chat.update`
+    refuses longer text with `msg_too_long` (unlike `chat.postMessage`, which accepts up
+    to 40,000).
 
     Refused unless `SLACK_ALLOW_WRITES=1` AND the target is allowed by
     `SLACK_WRITE_CHANNELS` / `SLACK_WRITE_USERS` (Slack Connect channels only by explicit
@@ -506,7 +615,8 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
 
     Returns:
     A confirmation echoing only what Slack returned: `channel`, `ts`, the stored `text`,
-    and any Slack warning — or an `Error ...` string.
+    and any Slack warning — plus a `signature` line (appended / already the last line /
+    not configured) — or an `Error ...` string.
 
     Examples:
     - `params = {"channel": "C0123ABCDEF", "ts": "1712345678.123456", "text": "Deploy done (v2) :rocket:"}`
@@ -517,9 +627,14 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
     - `cant_update_message`: not your message (or not editable); `edit_window_closed`: the workspace's
       edit window passed; `message_not_found`: check channel AND ts; `msg_too_long`: over 4,000
       characters; `missing_scope`: needs the `chat:write` user scope.
+    - `Error: text is N characters including the …-character signature …`: the signature pushed the
+      text over 4,000; nothing was sent — shorten the text.
     """
     try:
-        wire: dict[str, Any] = {"channel": params.channel, "ts": params.ts, **_text_field(params.format, params.text)}
+        text_out, signature_line = _prepare_text(
+            params.text, params.format, UPDATE_TEXT_MAX, " (chat.update refuses longer text with msg_too_long)"
+        )
+        wire: dict[str, Any] = {"channel": params.channel, "ts": params.ts, **_text_field(params.format, text_out)}
         body = await get_client().call("chat.update", wire)
         text = body.get("text")
         lines = [
@@ -530,6 +645,7 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
             f"- **channel**: {body.get('channel') or 'N/A'}",
             f"- **ts**: {body.get('ts') or 'N/A'} ({ts_to_human(body.get('ts'))})",
             f"- **text** (as Slack stored it):\n{text}" if text else "- **text**: Slack returned none",
+            signature_line,
         ]
         warnings = fmt_warnings(body)
         if warnings:
@@ -550,11 +666,13 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
     ),
 )
 async def slack_schedule_message(params: ScheduleMessageInput) -> str:
-    """Schedule a Slack message for later — it will be posted as you, with Slack's "Sent using @Alejandro AI" line.
+    """Schedule a Slack message for later, posted as you — Slack adds no label; SLACK_SIGNATURE signs it if set.
 
     Calls `chat.scheduleMessage` once with your user token. At `post_at` Slack posts the
-    message under your name and avatar, with Slack's "Sent using @Alejandro AI" line.
-    `post_at` is ISO-8601 (no offset = UTC) or epoch seconds, converted to epoch seconds;
+    message under your name and avatar. Slack does not label these messages: they look
+    exactly like ones you typed. To let teammates tell them apart, set `SLACK_SIGNATURE` —
+    the server appends it as the last line of every message it schedules (not again if the
+    text already ends with it; it counts toward the length limits). `post_at` is ISO-8601 (no offset = UTC) or epoch seconds, converted to epoch seconds;
     it must be in the future and at most 120 days ahead (checked locally — Slack's limit).
     Slack also refuses more than 30 scheduled messages within any 5-minute window in the
     same channel (`restricted_too_many`). Text and `format` work as in `slack_post_message`.
@@ -576,7 +694,8 @@ async def slack_schedule_message(params: ScheduleMessageInput) -> str:
 
     Returns:
     A confirmation echoing only what Slack returned: `scheduled_message_id`, `channel`, and
-    `post_at` as UTC time (plus epoch), and any Slack warning — or an `Error ...` string.
+    `post_at` as UTC time (plus epoch), and any Slack warning — plus a `signature` line
+    saying whether SLACK_SIGNATURE was appended — or an `Error ...` string.
 
     Examples:
     - `params = {"channel": "C0123ABCDEF", "post_at": "2026-10-12T14:00:00Z", "text": "Standup in 5 :clock9:"}`
@@ -589,13 +708,16 @@ async def slack_schedule_message(params: ScheduleMessageInput) -> str:
     - `time_in_past` / `time_too_far` (more than 120 days) / `invalid_time`; `restricted_too_many` (30 per
       channel per 5 minutes); `not_in_channel` (join in Slack first); `channel_not_found`; `is_archived`;
       `msg_too_long`; `missing_scope` (needs the `chat:write` user scope).
+    - `Error: text is N characters including the …-character signature …`: the signature pushed the
+      text over the limit; nothing was scheduled — shorten the text.
     - A timeout or 5xx means the execution status is UNKNOWN — do not schedule it again blindly.
     """
     try:
+        text, signature_line = _prepare_text(params.text, params.format, *_post_limit(params.format))
         wire: dict[str, Any] = {
             "channel": params.channel,
             "post_at": int(params.post_at),
-            **_text_field(params.format, params.text),
+            **_text_field(params.format, text),
             "unfurl_links": params.unfurl_links,
             "unfurl_media": params.unfurl_media,
         }
@@ -612,6 +734,7 @@ async def slack_schedule_message(params: ScheduleMessageInput) -> str:
             f"- **scheduled_message_id**: {body.get('scheduled_message_id') or 'N/A'}",
             f"- **channel**: {body.get('channel') or 'N/A'}",
             f"- **post_at**: {ts_to_human(post_at)} (epoch {post_at})" if post_at else "- **post_at**: N/A",
+            signature_line,
         ]
         warnings = fmt_warnings(body)
         if warnings:

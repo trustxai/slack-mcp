@@ -122,6 +122,47 @@ async def test_health_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fake.calls == [("auth.test", None, {})]
 
 
+SIGNATURE = "Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>"
+
+
+async def test_health_reports_the_signature_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(routes={"auth.test": AUTH_TEST})
+    _patch(monkeypatch, fake, Settings(slack_user_token=TOKEN))
+
+    result = await slack_health_check()
+
+    assert "- **signature**: off (set SLACK_SIGNATURE so teammates can tell these messages apart)" in result
+    assert "signature**: on" not in result
+
+
+async def test_health_reports_the_signature_on_with_its_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(routes={"auth.test": AUTH_TEST})
+    _patch(monkeypatch, fake, Settings(slack_user_token=TOKEN, slack_signature=f" {SIGNATURE}\n"))
+
+    result = await slack_health_check()
+
+    assert f"- **signature**: on ({len(SIGNATURE)} chars) — appended to every message" in result
+    assert "signature**: off" not in result
+
+
+async def test_health_reports_the_signature_even_without_a_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient()
+    _patch(monkeypatch, fake, Settings(slack_signature="— enviado con Alejandro AI"))
+
+    result = await slack_health_check()
+
+    assert "- **signature**: on (26 chars) — appended to every message" in result
+    assert "No Slack user token configured" in result
+    assert fake.calls == []
+
+
+def test_the_health_docstring_states_the_measured_fact() -> None:
+    doc = " ".join((slack_health_check.__doc__ or "").split())
+    assert "Slack does not label messages posted with a user token — they look exactly like ones you typed" in doc
+    assert "`SLACK_SIGNATURE`" in doc
+    assert "Sent using" not in doc
+
+
 async def test_health_lists_missing_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(routes={"auth.test": AUTH_TEST})
     fake.last_scopes = "channels:read, chat:write"

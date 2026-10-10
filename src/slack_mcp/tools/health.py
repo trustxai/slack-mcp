@@ -76,8 +76,11 @@ async def slack_health_check() -> str:
     Calls `auth.test` with the configured user token and renders the workspace, your
     user name and id, the token kind, and which of the scopes the tools need are
     granted (read from the `X-OAuth-Scopes` response header). Also states whether
-    writes are enabled (SLACK_ALLOW_WRITES) and how many channel / user ids the
-    allowlists contain.
+    writes are enabled (SLACK_ALLOW_WRITES), how many channel / user ids the
+    allowlists contain, and whether a signature is configured: Slack does not label
+    messages posted with a user token — they look exactly like ones you typed — so
+    `SLACK_SIGNATURE`, when set, is appended as the last line of every message the
+    chat tools post, reply, schedule or edit.
 
     When to Use:
     - As the first call after configuring the server, to confirm the token works.
@@ -89,8 +92,9 @@ async def slack_health_check() -> str:
     - To list channels (use `slack_list_conversations`).
 
     Returns:
-    A markdown block with the base URL, the write-guard state, connectivity, the
-    account, and the scope comparison — or an `Error ...` string describing the failure.
+    A markdown block with the base URL, the write-guard state, the signature state
+    (`on (N chars)` / `off`), connectivity, the account, and the scope comparison — or
+    an `Error ...` string describing the failure.
 
     Examples:
     - Call with no arguments: `slack_health_check()` (the tool takes no `params`).
@@ -114,6 +118,12 @@ async def slack_health_check() -> str:
                 if settings.slack_allow_writes
                 else "writes disabled (read-only; set SLACK_ALLOW_WRITES=1 plus SLACK_WRITE_CHANNELS / "
                 "SLACK_WRITE_USERS to allow posting)"
+            ),
+            "- **signature**: "
+            + (
+                f"on ({len(settings.signature)} chars) — appended to every message"
+                if settings.signature is not None
+                else "off (set SLACK_SIGNATURE so teammates can tell these messages apart)"
             ),
         ]
         problem = settings.token_problem()

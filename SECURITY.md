@@ -9,8 +9,12 @@ safely.
 ## The identity model
 
 - The only accepted credential is the *User OAuth Token* (`xoxp-…`) of your own internal,
-  non-distributed Slack app, installed in one workspace. Posts show your name and avatar
-  plus Slack's "Sent using @<app>" line.
+  non-distributed Slack app, installed in one workspace. Posts show your name and avatar.
+  Slack does not label these messages: they look exactly like ones you typed. To let
+  teammates tell them apart, set `SLACK_SIGNATURE` — the server appends it as the last
+  line of every message it posts (and keeps it on edits). It is message text, so anyone
+  can type the same line by hand: it tells teammates which messages came from the server,
+  it does not prove it.
 - Bot tokens (`xoxb-…`), app-level tokens (`xapp-…`), browser session tokens
   (`xoxc-…` / `xoxd-…`) and refresh tokens are refused before any request is sent.
 - Writes are off unless `SLACK_ALLOW_WRITES=1`, and even then a write must target a

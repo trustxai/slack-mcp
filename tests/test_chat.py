@@ -9,8 +9,10 @@ client's guard and on the wire as JSON.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -19,7 +21,7 @@ import pytest
 from pydantic import ValidationError
 
 from slack_mcp.client import SlackClient
-from slack_mcp.config import Settings
+from slack_mcp.config import Settings, get_settings
 from slack_mcp.errors import SlackApiError
 from slack_mcp.formatters import ts_to_human
 from slack_mcp.guard import WriteNotAllowedError, WritesDisabledError
@@ -32,6 +34,8 @@ from slack_mcp.tools.chat import (
     ReplyInThreadInput,
     ScheduleMessageInput,
     UpdateMessageInput,
+    _sign,
+    _signature_for,
     slack_post_message,
     slack_reply_in_thread,
     slack_schedule_message,
@@ -85,7 +89,11 @@ def _no_none(params: dict[str, Any]) -> None:
 )
 def test_every_tool_states_identity_gate_and_no_retry(tool: Any) -> None:
     doc = " ".join((tool.__doc__ or "").split())  # collapse line wraps
-    assert 'with Slack\'s "Sent using @Alejandro AI" line' in doc
+    assert "as you" in doc.lower()
+    # Measured 2026-10-10 (O-3): Slack adds no "via app" line to a user-token post.
+    assert "Slack does not label these messages: they look exactly like ones you typed." in doc
+    assert "To let teammates tell them apart, set `SLACK_SIGNATURE`" in doc
+    assert "Sent using" not in doc
     assert "Refused unless `SLACK_ALLOW_WRITES=1` AND the target is allowed by `SLACK_WRITE_CHANNELS` /" in doc
     assert "(Slack Connect channels only by explicit ID)" in doc
     assert "never retried" in (tool.__doc__ or "")  # on one line, so a plain grep finds it
@@ -742,3 +750,278 @@ async def test_e2e_allowlisted_post_goes_out_as_json_then_the_permalink_as_a_for
     assert parse_qs(permalink.content.decode()) == {"channel": [CHANNEL], "message_ts": [TS]}
     assert f"- **permalink**: {PERMALINK}" in result
     assert TOKEN not in result
+
+
+# --- SLACK_SIGNATURE (measured 2026-10-10, O-3: Slack does not label user-token posts) ---
+
+APP_URL = "https://masavaco.slack.com/marketplace/A0C835DFNSH"
+SIG = f"Sent using <{APP_URL}|@Alejandro AI>"  # what SLACK_SIGNATURE holds (mrkdwn)
+SIG_MD = f"Sent using [@Alejandro AI]({APP_URL})"  # the same line for markdown_text
+SIGNATURES = {"mrkdwn": SIG, "markdown": SIG_MD}
+TEXT_KEY = {"mrkdwn": "text", "markdown": "markdown_text"}
+
+
+def _sign_with(monkeypatch: pytest.MonkeyPatch, value: str = SIG) -> None:
+    monkeypatch.setattr("slack_mcp.tools.chat.get_settings", lambda: Settings(slack_signature=value))
+
+
+def test_sign_appends_the_signature_as_a_new_last_line() -> None:
+    assert _sign("Deploy done", Settings(slack_signature=SIG)) == (f"Deploy done\n{SIG}", True)
+    assert _sign("Deploy done", Settings(slack_signature=SIG), "markdown") == (f"Deploy done\n{SIG_MD}", True)
+
+
+def test_sign_without_a_signature_returns_the_text_unchanged() -> None:
+    assert _sign("Deploy done", Settings()) == ("Deploy done", False)
+    assert _sign("Deploy done", Settings(), "markdown") == ("Deploy done", False)
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+def test_sign_is_idempotent_on_an_already_signed_text(fmt: Any) -> None:
+    settings = Settings(slack_signature=SIG)
+    once, appended = _sign("Deploy done", settings, fmt)
+    assert appended is True
+    assert _sign(once, settings, fmt) == (once, False)  # never twice
+    assert _sign(f"Deploy done\n   {SIGNATURES[fmt]}  ", settings, fmt)[1] is False  # last line, trimmed
+    assert _sign(SIGNATURES[fmt], settings, fmt) == (SIGNATURES[fmt], False)  # the text IS the signature
+
+
+def test_sign_re_signs_when_the_signature_is_not_the_last_line() -> None:
+    settings = Settings(slack_signature=SIG)
+    middle = f"Quoting it:\n{SIG}\nand more after"
+    assert _sign(middle, settings) == (f"{middle}\n{SIG}", True)
+    same_line = f"Deploy done {SIG}"  # ends with it, but not as its own line
+    assert _sign(same_line, settings) == (f"{same_line}\n{SIG}", True)
+    # The mrkdwn form is not the markdown signature line (it would render literally there).
+    assert _sign(f"x\n{SIG}", settings, "markdown") == (f"x\n{SIG}\n{SIG_MD}", True)
+
+
+def test_signature_links_are_converted_only_for_markdown() -> None:
+    assert _signature_for("mrkdwn", SIG) == SIG
+    assert _signature_for("markdown", SIG) == SIG_MD
+    assert _signature_for("markdown", "via <https://a.example/x?y=1&z=2|my [bot]> and <mailto:a@b.example|mail>") == (
+        "via [my \\[bot\\]](https://a.example/x?y=1&z=2) and [mail](mailto:a@b.example)"
+    )
+    # A bare <url> is already a Markdown autolink; mentions, channel links and specials are not URLs.
+    untouched = "— <https://a.example> <@U0ANA000001> <#C0123ABCDEF|general> <!here>"
+    assert _signature_for("markdown", untouched) == untouched
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+async def test_post_sends_the_signed_text(monkeypatch: pytest.MonkeyPatch, fmt: Any) -> None:
+    _sign_with(monkeypatch)
+    fake = _FakeClient(routes={"chat.postMessage": _posted(), "chat.getPermalink": PERMALINK_OK})
+    _patch(monkeypatch, fake)
+
+    result = await slack_post_message(PostMessageInput(channel=CHANNEL, text="Deploy done", format=fmt))
+
+    assert fake.calls[0] == (
+        "chat.postMessage",
+        {
+            "channel": CHANNEL,
+            TEXT_KEY[fmt]: f"Deploy done\n{SIGNATURES[fmt]}",
+            "unfurl_links": False,
+            "unfurl_media": False,
+        },
+    )
+    assert "- **signature**: appended" in result
+    assert result.startswith("# Message sent")
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+async def test_reply_sends_the_signed_text(monkeypatch: pytest.MonkeyPatch, fmt: Any) -> None:
+    _sign_with(monkeypatch)
+    body = _posted(message={"type": "message", "ts": TS, "thread_ts": PARENT_TS})
+    fake = _FakeClient(routes={"chat.postMessage": body, "chat.getPermalink": PERMALINK_OK})
+    _patch(monkeypatch, fake)
+
+    result = await slack_reply_in_thread(
+        ReplyInThreadInput(channel=CHANNEL, thread_ts=PARENT_TS, text="On it", format=fmt)
+    )
+
+    assert fake.calls[0] == (
+        "chat.postMessage",
+        {
+            "channel": CHANNEL,
+            "thread_ts": PARENT_TS,
+            TEXT_KEY[fmt]: f"On it\n{SIGNATURES[fmt]}",
+            "reply_broadcast": False,
+            "unfurl_links": False,
+            "unfurl_media": False,
+        },
+    )
+    assert "- **signature**: appended" in result
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+async def test_schedule_sends_the_signed_text(monkeypatch: pytest.MonkeyPatch, fmt: Any) -> None:
+    _sign_with(monkeypatch)
+    when = int(time.time()) + 3_600
+    body = {"ok": True, "channel": CHANNEL, "scheduled_message_id": "Q1", "post_at": when}
+    fake = _FakeClient(routes={"chat.scheduleMessage": body})
+    _patch(monkeypatch, fake)
+
+    result = await slack_schedule_message(
+        ScheduleMessageInput(channel=CHANNEL, post_at=when, text="Standup", format=fmt)
+    )
+
+    assert fake.calls == [
+        (
+            "chat.scheduleMessage",
+            {
+                "channel": CHANNEL,
+                "post_at": when,
+                TEXT_KEY[fmt]: f"Standup\n{SIGNATURES[fmt]}",
+                "unfurl_links": False,
+                "unfurl_media": False,
+            },
+        )
+    ]
+    assert "- **signature**: appended" in result
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+async def test_update_signs_a_new_text_once(monkeypatch: pytest.MonkeyPatch, fmt: Any) -> None:
+    _sign_with(monkeypatch)
+    fake = _FakeClient(routes={"chat.update": {"ok": True, "channel": CHANNEL, "ts": TS}})
+    _patch(monkeypatch, fake)
+
+    result = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text="Deploy done (v2)", format=fmt))
+
+    assert fake.calls == [
+        ("chat.update", {"channel": CHANNEL, "ts": TS, TEXT_KEY[fmt]: f"Deploy done (v2)\n{SIGNATURES[fmt]}"})
+    ]
+    assert "- **signature**: appended" in result
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+async def test_update_of_a_signed_message_stays_signed_exactly_once(monkeypatch: pytest.MonkeyPatch, fmt: Any) -> None:
+    _sign_with(monkeypatch)
+    signed = f"Deploy done (v2)\n{SIGNATURES[fmt]}"  # e.g. the old text read back, edited above the signature
+    body = {"ok": True, "channel": CHANNEL, "ts": TS, "text": signed}
+    fake = _FakeClient(routes={"chat.update": body})
+    _patch(monkeypatch, fake)
+
+    result = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text=signed, format=fmt))
+
+    sent = fake.calls[0][1][TEXT_KEY[fmt]]
+    assert sent == signed
+    assert sent.count(SIGNATURES[fmt]) == 1
+    assert "- **signature**: already the last line of the text — not added again" in result
+    assert result.count(SIGNATURES[fmt]) == 1  # only in Slack's stored text
+
+
+async def test_every_confirmation_says_when_no_signature_is_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    when = int(time.time()) + 3_600
+    fake = _FakeClient(
+        routes={
+            "chat.postMessage": _posted(),
+            "chat.getPermalink": PERMALINK_OK,
+            "chat.update": {"ok": True, "channel": CHANNEL, "ts": TS},
+            "chat.scheduleMessage": {"ok": True, "channel": CHANNEL, "scheduled_message_id": "Q1", "post_at": when},
+        }
+    )
+    _patch(monkeypatch, fake)  # default settings: SLACK_SIGNATURE unset
+
+    results = [
+        await slack_post_message(PostMessageInput(channel=CHANNEL, text="a")),
+        await slack_reply_in_thread(ReplyInThreadInput(channel=CHANNEL, thread_ts=PARENT_TS, text="b")),
+        await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text="c")),
+        await slack_schedule_message(ScheduleMessageInput(channel=CHANNEL, post_at=when, text="d")),
+    ]
+
+    assert all("- **signature**: not configured" in result for result in results)
+    sent = [params.get("text") for method, params in fake.calls if method != "chat.getPermalink"]
+    assert sent == ["a", "b", "c", "d"]
+
+
+def _overflow_message(final: int, limit: int, signature: str) -> str:
+    return (
+        f"Error: text is {final:,} characters including the {len(signature):,}-character signature "
+        f"(SLACK_SIGNATURE); the limit is {limit:,}"
+    )
+
+
+async def test_update_cap_counts_the_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+    _sign_with(monkeypatch)
+    fake = _FakeClient(routes={"chat.update": {"ok": True, "channel": CHANNEL, "ts": TS}})
+    _patch(monkeypatch, fake)
+    room = UPDATE_TEXT_MAX - len(SIG) - 1  # the text that exactly fits with "\n" + signature
+
+    fits = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text="x" * room))
+    assert fits.startswith("# Message updated")
+    assert len(fake.calls[0][1]["text"]) == UPDATE_TEXT_MAX
+
+    over = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text="x" * (room + 3)))
+    assert over.startswith(_overflow_message(UPDATE_TEXT_MAX + 3, UPDATE_TEXT_MAX, SIG))
+    assert "(chat.update refuses longer text with msg_too_long)" in over
+    assert "shorten the text by at least 3 characters. Nothing was sent." in over
+    assert len(fake.calls) == 1  # the over-long edit never reached Slack
+
+
+@pytest.mark.parametrize(("fmt", "limit"), [("mrkdwn", POST_TEXT_MAX), ("markdown", MARKDOWN_TEXT_MAX)])
+async def test_post_reply_and_schedule_caps_count_the_signature(
+    monkeypatch: pytest.MonkeyPatch, fmt: Any, limit: int
+) -> None:
+    _sign_with(monkeypatch)
+    fake = _FakeClient(routes={"chat.postMessage": _posted(), "chat.getPermalink": PERMALINK_OK})
+    _patch(monkeypatch, fake)
+    signature = SIGNATURES[fmt]
+    text = "x" * (limit - len(signature))  # fits as typed; one over once "\n" + signature is added
+    when = int(time.time()) + 3_600
+
+    results = [
+        await slack_post_message(PostMessageInput(channel=CHANNEL, text=text, format=fmt)),
+        await slack_reply_in_thread(ReplyInThreadInput(channel=CHANNEL, thread_ts=PARENT_TS, text=text, format=fmt)),
+        await slack_schedule_message(ScheduleMessageInput(channel=CHANNEL, post_at=when, text=text, format=fmt)),
+    ]
+
+    for result in results:
+        assert result.startswith(_overflow_message(limit + 1, limit, signature)), result
+        assert "Nothing was sent." in result
+    assert fake.calls == []
+
+
+async def test_an_already_signed_text_at_the_cap_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _sign_with(monkeypatch)
+    fake = _FakeClient(routes={"chat.update": {"ok": True, "channel": CHANNEL, "ts": TS}})
+    _patch(monkeypatch, fake)
+    signed = "x" * (UPDATE_TEXT_MAX - len(SIG) - 1) + "\n" + SIG
+
+    result = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text=signed))
+
+    assert result.startswith("# Message updated")
+    assert fake.calls[0][1]["text"] == signed
+
+
+async def test_e2e_the_signature_from_the_env_goes_on_the_wire(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SLACK_SIGNATURE", f"  {SIG}\n")
+    get_settings.cache_clear()
+    recorder = _Recorder({"chat.postMessage": _posted(), "chat.getPermalink": PERMALINK_OK})
+    _real_client(monkeypatch, recorder, slack_allow_writes=True, slack_write_channels=CHANNEL)
+
+    result = await slack_post_message(PostMessageInput(channel=CHANNEL, text="hello"))
+
+    assert json.loads(recorder.requests[0].content)["text"] == f"hello\n{SIG}"
+    assert "- **signature**: appended" in result
+
+
+# The measured fact replaced every "Sent using …" promise; this keeps the claim from coming
+# back. In the docs the phrase may appear only as the recommended SLACK_SIGNATURE value.
+_REPO = Path(__file__).resolve().parents[1]
+_DOCS = ("README.md", ".env.example", "SECURITY.md")
+
+
+def test_no_source_file_claims_a_sent_using_line() -> None:
+    offenders = [
+        str(path.relative_to(_REPO))
+        for path in sorted((_REPO / "src").rglob("*.py"))
+        if "sent using" in path.read_text(encoding="utf-8").lower()
+    ]
+    assert offenders == []
+
+
+@pytest.mark.parametrize("name", _DOCS)
+def test_the_docs_mention_sent_using_only_as_the_signature_value(name: str) -> None:
+    text = (_REPO / name).read_text(encoding="utf-8")
+    claims = [match.start() for match in re.finditer(r"(?i)sent using(?! <https://)", text)]
+    assert claims == [], f"{name}: 'Sent using' outside a SLACK_SIGNATURE value at offsets {claims}"
