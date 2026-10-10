@@ -816,7 +816,7 @@ async def test_get_thread_json(monkeypatch: pytest.MonkeyPatch) -> None:
 
 # t17 — measured live 2026-10-10: a message posted WITH blocks reads back with its `text`
 # flattened (newlines → spaces) and its blocks verbatim.
-_SIGNATURE = "*Sent using* <@U0C931FSW4Q>"
+_SIGNATURE = "*Sent using* <@U0BOTUSER01>"
 _SIGNED_BLOCKS = [
     {"type": "section", "text": {"type": "mrkdwn", "text": "Deploy done\nSecond line"}},
     {"type": "context", "elements": [{"type": "mrkdwn", "text": _SIGNATURE}]},

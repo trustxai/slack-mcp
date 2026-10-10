@@ -36,8 +36,8 @@ class _FakeClient:
 
 AUTH_TEST = {
     "ok": True,
-    "url": "https://udocz.slack.com/",
-    "team": "uDocz",
+    "url": "https://acme.slack.com/",
+    "team": "Acme",
     "team_id": "T0123ABCDEF",
     "user": "alejandro",
     "user_id": "U0SELF00001",
@@ -112,7 +112,7 @@ async def test_health_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "Slack Connect channels only by explicit id" in result
     assert "token**: user token (xoxp) — every call runs as you" in result
     assert "connectivity**: OK" in result
-    assert "workspace**: uDocz (T0123ABCDEF) — https://udocz.slack.com/" in result
+    assert "workspace**: Acme (T0123ABCDEF) — https://acme.slack.com/" in result
     assert "you**: alejandro (U0SELF00001)" in result
     assert f"scopes granted**: {len(REQUIRED_USER_SCOPES) + 1}" in result
     assert "every scope the v0.1 tools need is granted" in result
@@ -122,7 +122,7 @@ async def test_health_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fake.calls == [("auth.test", None, {})]
 
 
-SIGNATURE = "Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>"
+SIGNATURE = "Sent using <https://acme.slack.com/marketplace/A0123456789|@Alejandro AI>"
 
 
 async def test_health_reports_the_signature_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:

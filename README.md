@@ -254,7 +254,7 @@ Writes stay off until you add `SLACK_ALLOW_WRITES=1` plus the allowlists
 Every client starts the server as a subprocess and passes settings through `env`.
 **Two workspaces means two entries**: same package, a different `SLACK_USER_TOKEN` (one
 app per workspace), and usually a different `SLACK_WRITE_USERS`. The examples below use
-`slack-udocz` and `slack-masava`. Leave out `SLACK_ALLOW_WRITES` for an entry that
+`slack-acme` and `slack-globex`. Leave out `SLACK_ALLOW_WRITES` for an entry that
 should only read.
 
 Keep the token out of config files where you can. Two ways to do that:
@@ -271,23 +271,23 @@ Keep the token out of config files where you can. Two ways to do that:
 ### Claude Code
 
 ```sh
-claude mcp add-json slack-udocz '{
+claude mcp add-json slack-acme '{
   "type": "stdio",
   "command": "op",
   "args": ["run", "--", "uvx", "amazing-slack-mcp"],
   "env": {
-    "SLACK_USER_TOKEN": "op://Private/slack-udocz/credential",
+    "SLACK_USER_TOKEN": "op://Private/slack-acme/credential",
     "SLACK_ALLOW_WRITES": "1",
     "SLACK_WRITE_USERS": "U0123ABCDEF"
   }
 }' --scope user
 
-claude mcp add-json slack-masava '{
+claude mcp add-json slack-globex '{
   "type": "stdio",
   "command": "op",
   "args": ["run", "--", "uvx", "amazing-slack-mcp"],
   "env": {
-    "SLACK_USER_TOKEN": "op://Private/slack-masava/credential",
+    "SLACK_USER_TOKEN": "op://Private/slack-globex/credential",
     "SLACK_ALLOW_WRITES": "1",
     "SLACK_WRITE_USERS": "U0456GHIJKL"
   }
@@ -295,8 +295,8 @@ claude mcp add-json slack-masava '{
 ```
 
 Without 1Password, use `"command": "uvx", "args": ["amazing-slack-mcp"]`. In a project
-`.mcp.json`, write the token as `"SLACK_USER_TOKEN": "${SLACK_UDOCZ_TOKEN}"` and export
-`SLACK_UDOCZ_TOKEN` in the shell that starts Claude Code. A literal `xoxp-…` value in
+`.mcp.json`, write the token as `"SLACK_USER_TOKEN": "${SLACK_ACME_TOKEN}"` and export
+`SLACK_ACME_TOKEN` in the shell that starts Claude Code. A literal `xoxp-…` value in
 `env` also works, but it then sits in plain text in the config file.
 
 ### Cursor
@@ -306,20 +306,20 @@ Without 1Password, use `"command": "uvx", "args": ["amazing-slack-mcp"]`. In a p
 ```json
 {
   "mcpServers": {
-    "slack-udocz": {
+    "slack-acme": {
       "command": "uvx",
       "args": ["amazing-slack-mcp"],
       "env": {
-        "SLACK_USER_TOKEN": "${env:SLACK_UDOCZ_TOKEN}",
+        "SLACK_USER_TOKEN": "${env:SLACK_ACME_TOKEN}",
         "SLACK_ALLOW_WRITES": "1",
         "SLACK_WRITE_USERS": "U0123ABCDEF"
       }
     },
-    "slack-masava": {
+    "slack-globex": {
       "command": "uvx",
       "args": ["amazing-slack-mcp"],
       "env": {
-        "SLACK_USER_TOKEN": "${env:SLACK_MASAVA_TOKEN}",
+        "SLACK_USER_TOKEN": "${env:SLACK_GLOBEX_TOKEN}",
         "SLACK_WRITE_USERS": "U0456GHIJKL"
       }
     }
@@ -327,7 +327,7 @@ Without 1Password, use `"command": "uvx", "args": ["amazing-slack-mcp"]`. In a p
 }
 ```
 
-(`slack-masava` here is read-only: no `SLACK_ALLOW_WRITES`.)
+(`slack-globex` here is read-only: no `SLACK_ALLOW_WRITES`.)
 
 ### Codex
 
@@ -335,7 +335,7 @@ Without 1Password, use `"command": "uvx", "args": ["amazing-slack-mcp"]`. In a p
 the environment Codex runs in, so the token never goes into the file:
 
 ```toml
-[mcp_servers.slack-udocz]
+[mcp_servers.slack-acme]
 command = "uvx"
 args = ["amazing-slack-mcp"]
 env_vars = ["SLACK_USER_TOKEN"]
@@ -347,10 +347,10 @@ same `SLACK_USER_TOKEN`. For a second workspace, give each entry its own referen
 `op run`:
 
 ```toml
-[mcp_servers.slack-masava]
+[mcp_servers.slack-globex]
 command = "op"
 args = ["run", "--", "uvx", "amazing-slack-mcp"]
-env = { SLACK_USER_TOKEN = "op://Private/slack-masava/credential", SLACK_WRITE_USERS = "U0456GHIJKL" }
+env = { SLACK_USER_TOKEN = "op://Private/slack-globex/credential", SLACK_WRITE_USERS = "U0456GHIJKL" }
 ```
 
 ### Claude Desktop
@@ -451,8 +451,8 @@ Without a bot user, the fallback is a link to your app's page. It renders the
 SLACK_SIGNATURE=*Sent using* <https://<workspace>.slack.com/marketplace/<APP_ID>|@Alejandro AI>
 ```
 
-For example, the author's app in the Masava workspace is
-`*Sent using* <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>`.
+For example, an app in the `acme` workspace is
+`*Sent using* <https://acme.slack.com/marketplace/A0123456789|@Alejandro AI>`.
 
 In a shell, quote the value (`*`, `<`, `>` and `|` are shell metacharacters); in a
 client's JSON `env` block it is an ordinary string. Either line only looks like Slack's

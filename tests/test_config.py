@@ -218,7 +218,7 @@ def test_get_settings_is_cached() -> None:
 
 # --- SLACK_SIGNATURE -------------------------------------------------------------------
 
-SIGNATURE = "Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>"
+SIGNATURE = "Sent using <https://acme.slack.com/marketplace/A0123456789|@Alejandro AI>"
 
 
 def test_signature_is_off_by_default() -> None:
