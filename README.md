@@ -484,21 +484,26 @@ line, and any app can post the same block. How it behaves:
   }
   ```
 
-- The `text` fallback is what Slack shows in notifications and search, and what
-  `slack_get_thread` / `slack_get_history` read back: the text, a **blank line**
-  (`"\n\n"`), then the signature. For `format: "markdown"` its `<url|label>` links are
-  written as `[label](url)` there; a `<@U…>` mention stays as it is. The signature never
-  goes inside a body block.
+- The `text` fallback is what Slack shows in notifications and search: the text, a
+  **blank line** (`"\n\n"`), then the signature. For `format: "markdown"` its
+  `<url|label>` links are written as `[label](url)` there; a `<@U…>` mention stays as it
+  is. The signature never goes inside a body block.
+- Slack flattens the `text` fallback of a message posted with blocks when it stores it:
+  every newline becomes a space (measured 2026-10-10), so it reads back as one line. The
+  read tools (`slack_get_thread`, `slack_get_history`) rebuild the text from the blocks,
+  so what you read back is what was posted: the text with its line breaks, then the
+  signature as its last line. A message typed by a person (only `rich_text` blocks)
+  still reads back from `text`; JSON mode returns the raw messages, blocks included.
 - `slack_update_message` resends the blocks with every edit, replacing the old ones (an
   edit that sends only `text` would drop them). The signature is appended unless the new
   text already ends with it, so an edit of a signed message stays signed exactly once:
-  the last line counts whatever number of blank lines comes before it, in either form
-  (`<url|label>` or `[label](url)`, so switching `format` on an edit is safe) and as
-  Slack stores it (`&` read back as `&amp;`), so editing the text read back from Slack
-  does not add a second line — the signature line is cut from the body and goes back in
-  the context block. A signature quoted in the middle of a text does not count; the text
-  is signed again at the end. Slack does not show its "edited" mark on an edit made with
-  blocks.
+  it counts whatever separates it from the text — blank lines, one newline, the spaces
+  Slack's flattened fallback leaves of them, or nothing — in either form (`<url|label>`
+  or `[label](url)`, so switching `format` on an edit is safe) and as Slack stores it
+  (`&` read back as `&amp;`), so editing the text read back from Slack does not add a
+  second one — the signature is cut from the body and goes back in the context block. A
+  signature quoted in the middle of a text does not count; the text is signed again at
+  the end. Slack does not show its "edited" mark on an edit made with blocks.
 - It counts toward Slack's length limits, blank line included: the caps apply to the
   final `text`. A text that only goes over because of the signature is refused before
   anything is sent, and the error says so. So is a signature longer than 3,000

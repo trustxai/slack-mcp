@@ -811,13 +811,84 @@ def test_sign_is_idempotent_on_an_already_signed_text(fmt: Any) -> None:
     assert _sign(SIGNATURES[fmt], settings, fmt) == (SIGNATURES[fmt], False)  # the text IS the signature
 
 
-def test_sign_re_signs_when_the_signature_is_not_the_last_line() -> None:
+def test_sign_re_signs_when_the_signature_is_not_at_the_end() -> None:
     settings = Settings(slack_signature=SIG)
     middle = f"Quoting it:\n{SIG}\nand more after"
     assert _sign(middle, settings) == (f"{middle}\n\n{SIG}", True)
-    same_line = f"Deploy done {SIG}"  # ends with it, but not as its own line
-    assert _sign(same_line, settings) == (f"{same_line}\n\n{SIG}", True)
+    assert _sign(f"Deploy done {SIG} and more", settings) == (f"Deploy done {SIG} and more\n\n{SIG}", True)
     assert _sign(f"x\n\n{SIG_MD}\n\nmore", settings, "markdown") == (f"x\n\n{SIG_MD}\n\nmore\n\n{SIG_MD}", True)
+    # A partial signature at the end (its last words only) is not the signature.
+    assert _sign("Deploy done <@U0BOT000001>", Settings(slack_signature="*Sent using* <@U0BOT000001>"))[1] is True
+
+
+# t17 — measured live 2026-10-10 (Masava self-DM, raw conversations.replies): Slack stores the
+# `text` fallback of a message posted WITH blocks with every newline turned into a space.
+LIVE_SIG = "*Sent using* <@U0C931FSW4Q>"
+LIVE_BODY = (
+    "slack-mcp t13 live write smoke slackmcpt135ba94e36e3 [EDITED by slack_update_message]: *mrkdwn bold*, a "
+    "mention of <@U0ME0000001> and a link <https://example.com|example.com link>. Second line: slack_get_thread "
+    "must render this as a continuation."
+)
+LIVE_DOUBLED = f"{LIVE_BODY}  {LIVE_SIG}  {LIVE_SIG}"  # the edit from read-back before t17, read back again
+LIVE_REPLY = f"[thread reply by slack_reply_in_thread] slackmcpt135ba94e36e3  {LIVE_SIG}"
+
+
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [
+        (LIVE_DOUBLED, LIVE_BODY),  # the doubled live text: both copies go
+        (f"{LIVE_BODY}  {LIVE_SIG}", LIVE_BODY),  # one signature behind two spaces (a flattened blank line)
+        (f"{LIVE_BODY}\n\n{LIVE_SIG}", LIVE_BODY),
+        (f"{LIVE_BODY}\n{LIVE_SIG}", LIVE_BODY),
+        (f"{LIVE_BODY}\t{LIVE_SIG}  ", LIVE_BODY),
+        # No separator at all still counts as trailing: the text ENDS with the signature.
+        (f"{LIVE_BODY}{LIVE_SIG}", LIVE_BODY),
+        (f"{LIVE_BODY}{LIVE_SIG}{LIVE_SIG} \n {LIVE_SIG}", LIVE_BODY),
+        (LIVE_REPLY, "[thread reply by slack_reply_in_thread] slackmcpt135ba94e36e3"),
+    ],
+)
+def test_a_trailing_signature_counts_whatever_separates_it(text: str, body: str) -> None:
+    settings = Settings(slack_signature=LIVE_SIG)
+    final, appended = _sign(text, settings)
+    assert (final, appended) == (f"{body}\n\n{LIVE_SIG}", False)
+    fields = _build_message(final, "mrkdwn", settings)
+    assert fields["text"].count(LIVE_SIG) == 1
+    assert [block["type"] for block in fields["blocks"]] == ["section", "context"]
+    assert fields["blocks"][0]["text"]["text"] == body  # no signature inside the section
+    assert LIVE_SIG not in json.dumps(fields["blocks"][0])
+    assert fields["blocks"][1] == {"type": "context", "elements": [{"type": "mrkdwn", "text": LIVE_SIG}]}
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+def test_a_flattened_or_glued_signature_is_recognised_in_every_form(fmt: Any) -> None:
+    """Both link forms, the mention form and the entity form, behind spaces or nothing."""
+    cases = [(SIG, SIG), (SIG, SIG_MD), (MENTION_SIG, MENTION_SIG), (AMP_SIG, AMP_SIG_READ_BACK)]
+    for signature, written in cases:
+        settings = Settings(slack_signature=signature)
+        for gap in ("  ", " ", ""):
+            final, appended = _sign(f"v2 of the report{gap}{written}", settings, fmt)
+            assert (final, appended) == (f"v2 of the report\n\n{_signature_for(fmt, signature)}", False), (
+                signature,
+                written,
+                gap,
+            )
+    # Entities are compared decoded, but a cut never lands inside one: the `&amp;` before
+    # the signature stays whole in the body.
+    settings = Settings(slack_signature=MENTION_SIG)
+    assert _sign(f"R&amp;D{MENTION_SIG}", settings, fmt) == (f"R&amp;D\n\n{MENTION_SIG}", False)
+    assert _sign(f"tail &lt;{MENTION_SIG}", settings, fmt) == (f"tail &lt;\n\n{MENTION_SIG}", False)
+
+
+async def test_update_from_the_flattened_live_read_back_keeps_one_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The edit flow that doubled the signature live: the read-back text, edited, sent back."""
+    _sign_with(monkeypatch, LIVE_SIG)
+    fake = _FakeClient(routes={"chat.update": {"ok": True, "channel": CHANNEL, "ts": TS}})
+    _patch(monkeypatch, fake)
+
+    result = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text=LIVE_DOUBLED))
+
+    assert fake.calls[0][1] == {"channel": CHANNEL, "ts": TS, **_message(LIVE_BODY, "mrkdwn", LIVE_SIG)}
+    assert "- **signature**: already the last line of the text — not added again (context block)" in result
 
 
 @pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
@@ -897,18 +968,28 @@ def test_a_bot_user_mention_signature_is_the_same_line_in_both_formats(fmt: Any)
         assert _sign(f"Deploy done{gap}{MENTION_SIG}", settings, fmt) == (signed, False), repr(gap)
 
 
-def test_a_signed_message_reads_back_as_a_blank_continuation_then_the_signature() -> None:
+def test_a_signed_message_reads_back_as_posted_then_the_signature_as_its_last_line() -> None:
     """The shape test_live_write's step 9 expects from slack_get_thread, pinned offline.
 
-    render_message prefixes every line after the first with `  │ ` and strips the blank
-    line's trailing space, so the blank line reads `  │` and the signature line carries the
-    `(ts …)` suffix.
+    What Slack stores for a signed post (t17, measured): the blocks verbatim and the `text`
+    fallback with its newlines flattened to spaces. render_message rebuilds the text from
+    the blocks — the section, then the context block's signature as the last line — and
+    prefixes every line after the first with `  │ `, the `(ts …)` suffix on the last.
     """
-    signed, _ = _sign("Deploy done", Settings(slack_signature=MENTION_SIG))
-    rendered = render_message({"user": "U0ME0000001", "text": signed, "ts": TS})
-    blank = MESSAGE_CONTINUATION.rstrip()
-    assert blank == "  │"
-    assert rendered.endswith(f": Deploy done\n{blank}\n{MESSAGE_CONTINUATION}{MENTION_SIG} (ts {TS})"), rendered
+    settings = Settings(slack_signature=MENTION_SIG)
+    signed, _ = _sign("Deploy done\nsecond line", settings)
+    stored = _build_message(signed, "mrkdwn", settings)
+    stored["text"] = " ".join(stored["text"].split("\n"))  # as Slack stores the fallback
+    rendered = render_message({"user": "U0ME0000001", "ts": TS, **stored})
+    assert rendered.endswith(
+        f": Deploy done\n{MESSAGE_CONTINUATION}second line\n{MESSAGE_CONTINUATION}{MENTION_SIG} (ts {TS})"
+    ), rendered
+    assert rendered.count(MENTION_SIG) == 1
+    # Without a signature nothing is rebuilt: plain `text`, stored as sent.
+    plain = _build_message("Deploy done\nsecond line", "mrkdwn", Settings())
+    assert render_message({"user": "U0ME0000001", "ts": TS, **plain}).endswith(
+        f": Deploy done\n{MESSAGE_CONTINUATION}second line (ts {TS})"
+    )
 
 
 # --- t16: a signed message goes out as Block Kit blocks + a `text` fallback --------------

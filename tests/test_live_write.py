@@ -26,15 +26,17 @@ thread stays readable in the Slack client from the printed permalinks.
 
 O-3 is answered (measured 2026-10-10, internal app, user token, a self-DM and a channel):
 Slack shows NO native app label under these posts — they look exactly like ones you typed.
-`SLACK_SIGNATURE` is what tells them apart. Step 6 edits the post from its text AS SLACK
-STORED IT (read back with `slack_get_thread`, so a signed post comes back signed and
-entity-encoded), which is the edit flow that must not double-sign. When the signature is
-set for the run (shell or .env), step 9 asserts that the post (after that edit) and the
-thread reply end with the signature line after a blank line, and that it appears exactly
-twice in the thread (once each), on the `text` read-back; and, in JSON mode (the raw
-messages), that both carry a Block Kit `context` block holding the signature (t16) while
-no other block of theirs contains it. Unset, that check is skipped and the result block
-says so.
+`SLACK_SIGNATURE` is what tells them apart. Step 6 edits the post from its text AS IT READS
+BACK (`slack_get_thread` JSON, through `formatters.message_text`: rebuilt from the blocks,
+since Slack stores the `text` fallback of a block message with its newlines flattened to
+spaces — measured 2026-10-10, t17), which is the edit flow that must not double-sign. Step
+9 asserts the post's second line is back as a `  │ ` continuation. When the signature is
+set for the run (shell or .env), it also asserts that the post (after that edit) and the
+thread reply end with the signature on its own last line, exactly once in each one's
+rendered text (twice in the thread); and, in JSON mode (the raw messages), that each raw
+`text` holds it exactly once, that both carry ONE Block Kit `context` block holding it
+(t16), and that no other block of theirs (`section` / `markdown`) contains it. Unset, the
+signature checks are skipped and the result block says so.
 """
 
 from __future__ import annotations
@@ -54,7 +56,7 @@ import pytest
 from slack_mcp.client import SlackClient, get_client, reset_client
 from slack_mcp.config import get_settings
 from slack_mcp.errors import SlackApiError
-from slack_mcp.formatters import MESSAGE_CONTINUATION, ResponseFormat
+from slack_mcp.formatters import MESSAGE_CONTINUATION, ResponseFormat, message_text, render_message
 from slack_mcp.tools.chat import (
     PostMessageInput,
     ReplyInThreadInput,
@@ -235,15 +237,19 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
     _RUN["permalink_reply"] = _field(replied, "permalink")
 
     # -- step 6: update the first post (keeps the mention, the link and the second line) --
-    # Edit the text AS SLACK STORED IT, read back with slack_get_thread: with SLACK_SIGNATURE
-    # set it already ends with the signature (entity-encoded where Slack encodes `&`), and the
-    # edit must not sign it a second time.
+    # Edit the text AS IT READS BACK: the raw message from slack_get_thread (JSON), through
+    # message_text — rebuilt from its blocks when signed, because Slack flattens the `text`
+    # fallback of a block message (newlines → spaces). With SLACK_SIGNATURE set it already
+    # ends with the signature, and the edit must not sign it a second time.
     stored = await slack_get_thread(
         GetThreadInput(channel=dm, thread_ts=ts1, limit=5, response_format=ResponseFormat.JSON)
     )
     stored_items = json.loads(stored).get("items") or []
-    read_back = next((str(item.get("text") or "") for item in stored_items if item.get("ts") == ts1), "")
+    read_back = next((message_text(item) for item in stored_items if item.get("ts") == ts1), "")
     assert f"smoke {nonce}:" in read_back, f"step 6 read-back: the post's stored text was not found:\n{stored}"
+    assert SECOND_LINE in read_back.splitlines(), (
+        f"step 6 read-back: the second line is not a line of its own:\n{stored}"
+    )
     edited_text = read_back.replace(f"smoke {nonce}:", f"smoke {nonce} {EDIT_MARKER}:", 1)
     updated = await slack_update_message(UpdateMessageInput(channel=dm, ts=ts1, text=edited_text))
     print("== slack_update_message ==\n" + updated)
@@ -290,31 +296,42 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
         f"step 9 get_thread: the second line is not rendered as a {MESSAGE_CONTINUATION!r} continuation:\n{thread}"
     )
     # SLACK_SIGNATURE (O-3): when set, the post (as edited) and the reply must END with it, once,
-    # after a blank line (t15). render_message prefixes every line after the first with `  │ `
-    # (the blank line reads `  │`, its trailing space stripped) and puts the `(ts …)` suffix on
-    # a message's last line, so "a blank line, then the signature as the last line" reads as
-    # `  │` + newline + `  │ <signature> (ts <ts>)` — the shape test_chat pins offline against
-    # render_message. Compared entity-decoded: Slack stores an `&` of the signature as `&amp;`.
+    # on a line of its own. A signed message is read back from its blocks (t17: Slack flattens
+    # the stored `text` of a block message): the section text, then the context block's text as
+    # the last line. render_message prefixes every line after the first with `  │ ` and puts the
+    # `(ts …)` suffix on the last one, so the signature reads `  │ <signature> (ts <ts>)` — the
+    # shape test_formatters / test_conversations pin offline. Compared entity-decoded: Slack
+    # stores an `&` of the signature as `&amp;`.
     if signature:
         plain_thread, plain_signature = html.unescape(thread), html.unescape(signature)
-        blank_line = MESSAGE_CONTINUATION.rstrip()
         for label, ts in (("post, after its edit", ts1), ("thread reply", reply_ts)):
-            assert f"\n{blank_line}\n{MESSAGE_CONTINUATION}{plain_signature} (ts {ts})" in plain_thread, (
-                f"step 9 signature: the {label} ({ts}) does not end with a blank line and then SLACK_SIGNATURE "
-                f"{signature!r}:\n{thread}"
+            assert f"\n{MESSAGE_CONTINUATION}{plain_signature} (ts {ts})" in plain_thread, (
+                f"step 9 signature: the {label} ({ts}) does not end with SLACK_SIGNATURE {signature!r} on a line of "
+                f"its own:\n{thread}"
             )
         assert plain_thread.count(plain_signature) == 2, (
             f"step 9 signature: expected it exactly twice (post + reply), found "
             f"{plain_thread.count(plain_signature)} — the edit from the read-back text double-signed?\n{thread}"
         )
-        # t16: the stored messages carry the signature in a `context` block (the raw `blocks`,
-        # read in JSON mode), and no other block of theirs repeats it — the edit resent them.
+        # t16/t17: the stored messages carry the signature in ONE `context` block (the raw
+        # `blocks`, read in JSON mode), no section / markdown block of theirs repeats it — the
+        # edit resent them — and their raw `text` fallback holds it exactly once.
         raw_thread = await slack_get_thread(
             GetThreadInput(channel=dm, thread_ts=ts1, limit=20, response_format=ResponseFormat.JSON)
         )
         raw_items = {str(item.get("ts")): item for item in json.loads(raw_thread).get("items") or []}
         for label, ts in (("post, after its edit", ts1), ("thread reply", reply_ts)):
-            blocks = [block for block in raw_items.get(ts, {}).get("blocks") or [] if isinstance(block, dict)]
+            raw_item = raw_items.get(ts, {})
+            raw_text = html.unescape(str(raw_item.get("text") or ""))
+            assert raw_text.count(plain_signature) == 1, (
+                f"step 9 signature: the stored {label} ({ts}) holds SLACK_SIGNATURE {raw_text.count(plain_signature)} "
+                f"time(s) in its raw `text`, not once: {raw_text[-500:]!r}"
+            )
+            rendered = html.unescape(render_message(raw_item))
+            assert rendered.count(plain_signature) == 1 and rendered.split(" (ts ")[0].endswith(plain_signature), (
+                f"step 9 signature: the {label} ({ts}) does not render the signature once, as its last line:\n{rendered}"
+            )
+            blocks = [block for block in raw_item.get("blocks") or [] if isinstance(block, dict)]
             contexts = [block for block in blocks if block.get("type") == "context"]
             context_text = " ".join(
                 html.unescape(str(element.get("text") or ""))
@@ -345,8 +362,9 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
             if isinstance(block, dict)
         ]
         _RUN["signature"] = (
-            f"on ({len(signature)} chars) — verified as the last line, after a blank line, of the post (after its "
-            f"edit) and of the reply, and as their one context block; the markdown post's last line reads back as: "
+            f"on ({len(signature)} chars) — verified once, as the last line read back (rebuilt from the blocks), of "
+            f"the post (after its edit from that read-back) and of the reply, once in each raw `text`, and as their "
+            f"one context block; the markdown post's last line reads back as: "
             f"{_line(md_thread, '(ts ' + _RUN['md_ts'] + ')')!r}, its stored block types: {md_block_types}"
         )
     else:
