@@ -387,7 +387,7 @@ changing one. String values are whitespace-stripped. Real environment variables 
 | `SLACK_ALLOW_WRITES` | off | Kill-switch. `1` allows posting, replying, editing, scheduling, reacting and opening DMs, and even then every write must pass the allowlists. |
 | `SLACK_WRITE_CHANNELS` | *(empty)* | Comma-separated conversation IDs (`C…`, `G…`, `D…`) a write may target. IDs only; a `#name` never matches. The only way to write to a Slack Connect channel or a shared group DM. |
 | `SLACK_WRITE_USERS` | *(empty)* | Comma-separated user IDs (`U…`, `W…`). A DM or group DM is writable when every *other* member is listed, and `slack_open_conversation` only opens conversations with these people. Your own self-DM needs no entry. |
-| `SLACK_SIGNATURE` | *(empty = off)* | A line the server appends (`"\n"` + signature) to every message it posts, replies with or schedules, and keeps on edits — never twice. Slack does not label these messages, so this is how teammates can tell them apart. Slack mrkdwn, one line (a multi-line value is joined into one); it counts toward the length limits. See [Signing your messages](#signing-your-messages). |
+| `SLACK_SIGNATURE` | *(empty = off)* | A line the server appends (`"\n"` + signature; after a blank line for `format: "markdown"`) to every message it posts, replies with or schedules, and keeps on edits — never twice. Slack does not label these messages, so this is how teammates can tell them apart. Slack mrkdwn, one line (a multi-line value is joined into one); it counts toward the length limits. See [Signing your messages](#signing-your-messages). |
 | `SLACK_API_URL` | `https://slack.com/api` | Web API base URL, for proxies and tests. Must be `https://`; plain `http://` is accepted only for `127.0.0.1` / `localhost`. |
 | `SLACK_REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout. A timed-out write is reported as outcome UNKNOWN, never retried. |
 | `SLACK_TEST_ALLOW_WRITES` | *(unset)* | **Test suite only**, never read by the server. `1` opens the `live_write` tests, but only when it is in the environment pytest starts with (a value in `.env` is ignored for this variable) and only with exactly `-m live_write`. See [Running the tests](#running-the-tests). |
@@ -411,10 +411,24 @@ shell metacharacters); in a client's JSON `env` block it is an ordinary string. 
 own small grey app label cannot be produced by a message, so this line is plain message
 text. How it behaves:
 
-- It is added as a new last line (`"\n"` + signature) to `slack_post_message`,
-  `slack_reply_in_thread` and `slack_schedule_message`, in both formats. Write it in
-  mrkdwn; for `format: "markdown"` the server rewrites each `<url|label>` link as
-  `[label](url)`.
+- It is added as a new last line to `slack_post_message`, `slack_reply_in_thread` and
+  `slack_schedule_message`, in both formats. Write it in mrkdwn. With the default
+  `format: "mrkdwn"` it follows a single line break (`"\n"` + signature). With
+  `format: "markdown"` it follows a **blank line** (`"\n\n"` + signature), because in
+  Markdown a line right after a list item, a `>` quote or a table row would be pulled
+  into that block, and each `<url|label>` link is rewritten as `[label](url)`. With the
+  value above, what goes to Slack is:
+
+  ```text
+  format "mrkdwn":    Deploy done :rocket:
+                      Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>
+
+  format "markdown":  - one
+                      - two
+
+                      Sent using [@Alejandro AI](https://masavaco.slack.com/marketplace/A0C835DFNSH)
+  ```
+
 - `slack_update_message` applies the same rule: the signature is appended unless the new
   text already ends with it, so an edit of a signed message stays signed exactly once. A
   signature quoted in the middle of a text does not count; the text is signed again at

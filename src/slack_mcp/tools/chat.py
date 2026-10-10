@@ -112,20 +112,29 @@ def _signature_for(fmt: MessageFormat, signature: str) -> str:
     return _MRKDWN_LINK.sub(lambda m: f"[{_markdown_label(m.group(2))}]({m.group(1)})", signature)
 
 
-def _sign(text: str, settings: Settings, fmt: MessageFormat = "mrkdwn") -> tuple[str, bool]:
-    """`(text to send, appended?)` — `text + "\\n" + signature` unless it already ends with it.
+# What goes between the text and the signature. In mrkdwn a newline is a line break. In
+# Markdown a single newline after a list item, a `>` quote or a table row continues that
+# block (the signature would render as part of the last bullet / quote / row), so there
+# it follows a BLANK line — a paragraph of its own.
+_SIGNATURE_SEPARATOR: dict[MessageFormat, str] = {"mrkdwn": "\n", "markdown": "\n\n"}
 
-    "Already ends with it" means the LAST line (whitespace-trimmed) equals the signature as
-    written for `fmt`: re-sending a signed text (an edit of a signed message) keeps exactly
-    one signature, while a signature quoted in the middle of the text is signed again at
-    the end. No signature configured → the text unchanged.
+
+def _sign(text: str, settings: Settings, fmt: MessageFormat = "mrkdwn") -> tuple[str, bool]:
+    """`(text to send, appended?)` — the text plus the signature line, unless it already ends with it.
+
+    Appends `"\\n" + signature` for mrkdwn and `"\\n\\n" + signature` (after a blank line)
+    for markdown. "Already ends with it" means the LAST line (whitespace-trimmed) equals the
+    signature as written for `fmt`, however many blank lines precede it: re-sending a
+    signed text (an edit of a signed message) keeps exactly one signature, while a
+    signature quoted in the middle of the text is signed again at the end. No signature
+    configured → the text unchanged.
     """
     if settings.signature is None:
         return text, False
     signature = _signature_for(fmt, settings.signature)
     if text.rsplit("\n", 1)[-1].strip() == signature:
         return text, False
-    return f"{text}\n{signature}", True
+    return f"{text}{_SIGNATURE_SEPARATOR[fmt]}{signature}", True
 
 
 class SignedTextTooLongError(RuntimeError):

@@ -22,8 +22,14 @@ Writes are forced ON with `SLACK_WRITE_CHANNELS` and `SLACK_WRITE_USERS` both EM
 self-DM must pass with no allowlist entry (guard row 6: "your self-DM therefore passes once
 writes are on"; row 5's Slack Connect refusal must not fire for it). No channel id and no
 other person's id is ever used. Nothing is deleted — there is no delete tool — so the
-thread stays readable in the Slack client, where O-3 (the "Sent using …" line) is checked
-by eye from the printed permalinks.
+thread stays readable in the Slack client from the printed permalinks.
+
+O-3 is answered (measured 2026-10-10, internal app, user token, self-DM and a public
+channel): Slack shows NO native app label under these posts — they look exactly like ones
+you typed. `SLACK_SIGNATURE` is what tells them apart. When it is set for the run (shell or
+.env), step 9 asserts that the post (after its edit) and the thread reply, as read back by
+`slack_get_thread`, end with the signature line exactly once; unset, that check is skipped
+and the result block says so.
 """
 
 from __future__ import annotations
@@ -190,9 +196,15 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
     assert _field(posted, "channel") == dm, f"step 3 post mrkdwn: Slack answered for another channel:\n{posted}"
     _RUN["ts1"] = ts1
     _RUN["permalink1"] = _field(posted, "permalink")
+    signature = get_settings().signature
     _ANSWERS["O-3"] = (
-        "the API returns no attribution field — open the permalinks below in the Slack client and record whether "
-        "a 'Sent using @<app>' line shows under the posts"
+        "answered 2026-10-10: Slack shows no native app label under user-token posts (they look exactly like "
+        "typed ones); SLACK_SIGNATURE is what differentiates them — "
+        + (
+            f"set for this run ({len(signature)} chars): see the signature line below"
+            if signature
+            else "NOT set for this run, so these posts carry no marker"
+        )
     )
 
     # -- step 4: post (markdown) ---------------------------------------------------------
@@ -260,6 +272,25 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
     assert f"{MESSAGE_CONTINUATION}{SECOND_LINE}" in thread, (
         f"step 9 get_thread: the second line is not rendered as a {MESSAGE_CONTINUATION!r} continuation:\n{thread}"
     )
+    # SLACK_SIGNATURE (O-3): when set, the post (as edited) and the reply must END with it, once.
+    # render_message puts the `(ts …)` suffix on a message's last line, so "last line == the
+    # signature" reads as `  │ <signature> (ts <ts>)`.
+    if signature:
+        for label, ts in (("post, after its edit", ts1), ("thread reply", reply_ts)):
+            assert f"{MESSAGE_CONTINUATION}{signature} (ts {ts})" in thread, (
+                f"step 9 signature: the {label} ({ts}) does not end with SLACK_SIGNATURE {signature!r}:\n{thread}"
+            )
+        doubled = f"{MESSAGE_CONTINUATION}{signature}\n{MESSAGE_CONTINUATION}{signature} (ts "
+        assert doubled not in thread, f"step 9 signature: a message ends with the signature TWICE:\n{thread}"
+        # The markdown post is not asserted — how Slack stores markdown_text is not measured
+        # yet — only recorded, to compare by eye with its permalink.
+        md_thread = await slack_get_thread(GetThreadInput(channel=dm, thread_ts=_RUN["md_ts"], limit=1))
+        _RUN["signature"] = (
+            f"on ({len(signature)} chars) — verified as the last line of the post (after its edit) and of the "
+            f"reply; the markdown post's last line reads back as: {_line(md_thread, '(ts ' + _RUN['md_ts'] + ')')!r}"
+        )
+    else:
+        _RUN["signature"] = "off (SLACK_SIGNATURE unset for this run) — the signature check was skipped"
 
     # -- step 10: read back the history --------------------------------------------------
     history = await slack_get_history(GetHistoryInput(channel=dm, limit=20))
@@ -342,6 +373,7 @@ def test_4_live_write_smoke_result() -> None:
         f"- scheduled_message_id: {_RUN.get('scheduled_id') or 'N/A'} (post_at {_RUN.get('post_at') or 'N/A'})",
         f"- update kept the mention verbatim: {_RUN.get('mention_kept', 'N/A')}; the link: {_RUN.get('link_kept', 'N/A')}",
         f"- search: {_RUN.get('search', 'not run')}",
+        f"- signature: {_RUN.get('signature', 'not checked (step 9 did not run)')}",
         f"- scopes granted: {_RUN.get('scopes', 'N/A')}",
     ]
     for item in ("O-2", "O-3", "O-4", "O-11", "O-22", "O-23"):
