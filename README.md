@@ -5,11 +5,11 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for the
 [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) (FastMCP). It
 **speaks as you**: the only credential it accepts is the *User OAuth Token* (`xoxp-…`) of
 your own internal Slack app, so everything it posts shows your name and avatar, and
-everything it reads is what you can see in Slack. In a real workspace, posts made with a
-user token showed a small "Sent using <app name>" line under the message. Slack's docs
-do not describe that line, so treat it as observed behaviour, not a guarantee. The tool
-descriptions say "Sent using @Alejandro AI" because that is the author's app; your posts
-show your own app's name.
+everything it reads is what you can see in Slack. Slack does not label these messages:
+they look exactly like ones you typed (measured with an internal app, in a self-DM and in
+a channel). To let teammates tell them apart, set `SLACK_SIGNATURE` — the server
+appends it as the last line of every message it posts, replies with or schedules, and
+keeps it on edits. See [Signing your messages](#signing-your-messages).
 
 You create **one personal, internal app per workspace** (see [Prerequisites](#prerequisites--create-the-slack-app)).
 The server runs over **stdio only**. There is no HTTP transport, so a token that acts as
@@ -47,6 +47,11 @@ the HTTP client, not in the tools, so no tool can forget them:
   in `SLACK_WRITE_USERS`. Slack does not reliably flag DMs with external people, so for
   DMs the member allowlist is the gate that holds: nobody gets a message unless you
   listed them, or the conversation, yourself.
+- **Nothing marks a post as automated unless you sign it.** Slack shows these messages
+  under your name with no app label, exactly like ones you typed. Set `SLACK_SIGNATURE`
+  so every message the server posts ends with a line that says it was sent by your app
+  ([Signing your messages](#signing-your-messages)). `slack_health_check` says whether it
+  is on.
 - **A write is never retried.** A retried post is a duplicate message. A timeout or 5xx
   on a write is reported as outcome UNKNOWN: read the conversation back before trying
   again. (A read is retried once on HTTP 429, and only when Slack asks to wait 10 s or
@@ -99,7 +104,8 @@ every one is in the [table](#available-tools).
   `markdown_text`). After a post or a thread reply, the confirmation includes the
   message's permalink. If the permalink lookup fails, the message is still reported as
   sent. Every confirmation repeats only what Slack returned, including any warning Slack
-  attached.
+  attached, plus a `signature` line: `SLACK_SIGNATURE`, when set, is appended as the last
+  line of every post, reply and scheduled message, and an edit keeps it exactly once.
 - **Reactions.** `slack_add_reaction` 🔒 and `slack_remove_reaction` 🔒 (yours only).
   Colons around the emoji name are stripped. "Already there" and "not there" are
   reported as outcomes, not errors.
@@ -108,8 +114,8 @@ every one is in the [table](#available-tools).
   with a **user token**, because a bot token cannot search at all. That is one reason
   this server speaks as you.
 - **Health.** `slack_health_check` calls `auth.test` and shows who you are, the token
-  kind, the granted scopes compared with the 15 the tools need, and the write-guard
-  state.
+  kind, the granted scopes compared with the 15 the tools need, the write-guard state,
+  and whether a signature is on.
 
 Read tools other than `slack_health_check` take `response_format: "markdown"`
 (default) or `"json"` (the raw Slack objects). Markdown output is capped at 50 rows per call. Cursor-paginated tools print
@@ -139,10 +145,10 @@ All **18 tools**, grouped by module. 🔒 = refused unless `SLACK_ALLOW_WRITES=1
 | `slack_lookup_user_by_email` | Find the person behind an email address and show their profile. |
 | `slack_resolve_user` | Turn a name, display name or @handle into Slack user ids, ranked by similarity. |
 | **Chat — post, reply, edit, schedule** | |
-| `slack_post_message` 🔒 | Post a message to a Slack channel, DM or group DM — posted as you, with Slack's "Sent using @Alejandro AI" line. |
-| `slack_reply_in_thread` 🔒 | Reply inside a Slack thread — posted as you, with Slack's "Sent using @Alejandro AI" line. |
-| `slack_schedule_message` 🔒 | Schedule a Slack message for later — it will be posted as you, with Slack's "Sent using @Alejandro AI" line. |
-| `slack_update_message` 🔒 | Edit one of your own Slack messages — the edit is made as you, with Slack's "Sent using @Alejandro AI" line. |
+| `slack_post_message` 🔒 | Post a message to a Slack channel, DM or group DM as you — Slack adds no label; SLACK_SIGNATURE signs it if set. |
+| `slack_reply_in_thread` 🔒 | Reply inside a Slack thread as you — Slack adds no label; SLACK_SIGNATURE signs it if set. |
+| `slack_schedule_message` 🔒 | Schedule a Slack message for later, posted as you — Slack adds no label; SLACK_SIGNATURE signs it if set. |
+| `slack_update_message` 🔒 | Edit one of your own Slack messages as you — a SLACK_SIGNATURE line, if set, stays exactly once. |
 | **Reactions** | |
 | `slack_add_reaction` 🔒 | Add an emoji reaction to a message, as you. |
 | `slack_remove_reaction` 🔒 | Remove one of YOUR emoji reactions from a message. |
@@ -159,7 +165,8 @@ You need Python 3.13+ (or just [uv](https://docs.astral.sh/uv/), which brings it
 and one Slack app **per workspace**, created by you, for you:
 
 1. Go to <https://api.slack.com/apps> → **Create New App** → **From scratch**. Give it any
-   name: it is the name shown in the "Sent using …" line (the author's is "Alejandro AI").
+   name (the author's is "Alejandro AI"). Slack does not show it on your messages; to name
+   it there, put it in `SLACK_SIGNATURE` ([Signing your messages](#signing-your-messages)).
    Pick the workspace.
 2. **OAuth & Permissions** → **Scopes** → **User Token Scopes** (*not* Bot Token Scopes)
    → add exactly these 15:
@@ -380,9 +387,61 @@ changing one. String values are whitespace-stripped. Real environment variables 
 | `SLACK_ALLOW_WRITES` | off | Kill-switch. `1` allows posting, replying, editing, scheduling, reacting and opening DMs, and even then every write must pass the allowlists. |
 | `SLACK_WRITE_CHANNELS` | *(empty)* | Comma-separated conversation IDs (`C…`, `G…`, `D…`) a write may target. IDs only; a `#name` never matches. The only way to write to a Slack Connect channel or a shared group DM. |
 | `SLACK_WRITE_USERS` | *(empty)* | Comma-separated user IDs (`U…`, `W…`). A DM or group DM is writable when every *other* member is listed, and `slack_open_conversation` only opens conversations with these people. Your own self-DM needs no entry. |
+| `SLACK_SIGNATURE` | *(empty = off)* | A line the server appends (`"\n"` + signature; after a blank line for `format: "markdown"`) to every message it posts, replies with or schedules, and keeps on edits — never twice. Slack does not label these messages, so this is how teammates can tell them apart. Slack mrkdwn, one line (a multi-line value is joined into one); it counts toward the length limits. See [Signing your messages](#signing-your-messages). |
 | `SLACK_API_URL` | `https://slack.com/api` | Web API base URL, for proxies and tests. Must be `https://`; plain `http://` is accepted only for `127.0.0.1` / `localhost`. |
 | `SLACK_REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout. A timed-out write is reported as outcome UNKNOWN, never retried. |
 | `SLACK_TEST_ALLOW_WRITES` | *(unset)* | **Test suite only**, never read by the server. `1` opens the `live_write` tests, but only when it is in the environment pytest starts with (a value in `.env` is ignored for this variable) and only with exactly `-m live_write`. See [Running the tests](#running-the-tests). |
+
+## Signing your messages
+
+Slack does not label these messages: they look exactly like ones you typed. Measured on
+2026-10-10 with an internal app and a user token, in a self-DM and in a channel:
+no app label under the message. To let teammates tell them apart, set `SLACK_SIGNATURE`
+— the server appends it as the last line of every message it posts. The closest match to
+an app label is a link to your app's page, which renders the `@Alejandro AI` part in link
+colour, like a tag:
+
+```sh
+# .env — your workspace's subdomain, and the App ID from your app's Basic Information page
+SLACK_SIGNATURE=Sent using <https://<workspace>.slack.com/marketplace/<APP_ID>|@Alejandro AI>
+```
+
+For example, the author's app in the Masava workspace is
+`Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>`. In a
+shell, quote the value (`<`, `>` and `|` are shell metacharacters); in a client's JSON
+`env` block it is an ordinary string. Slack's own small grey app label cannot be
+produced by a message, so this line is plain message text — a marker, not provenance:
+anyone can type the same line by hand. How it behaves:
+
+- It is added as a new last line to `slack_post_message`, `slack_reply_in_thread` and
+  `slack_schedule_message`, in both formats. Write it in mrkdwn. With the default
+  `format: "mrkdwn"` it follows a single line break (`"\n"` + signature). With
+  `format: "markdown"` it follows a **blank line** (`"\n\n"` + signature), because in
+  Markdown a line right after a list item, a `>` quote or a table row would be pulled
+  into that block, and each `<url|label>` link is rewritten as `[label](url)`. With the
+  value above, what goes to Slack is:
+
+  ```text
+  format "mrkdwn":    Deploy done :rocket:
+                      Sent using <https://<workspace>.slack.com/marketplace/<APP_ID>|@Alejandro AI>
+
+  format "markdown":  - one
+                      - two
+
+                      Sent using [@Alejandro AI](https://<workspace>.slack.com/marketplace/<APP_ID>)
+  ```
+
+- `slack_update_message` applies the same rule: the signature is appended unless the new
+  text already ends with it, so an edit of a signed message stays signed exactly once.
+  The last line counts in either form (`<url|label>` or `[label](url)`, so switching
+  `format` on an edit is safe) and as Slack stores it (`&` read back as `&amp;`), so
+  editing the text read back from Slack does not add a second line. In markdown an
+  existing signature line is moved behind a blank line. A signature quoted in the middle
+  of a text does not count; the text is signed again at the end.
+- It counts toward Slack's length limits. A text that only goes over because of the
+  signature is refused before anything is sent, and the error says so.
+- Every confirmation has a `signature` line (`appended`, `already the last line …`, or
+  `not configured`), and `slack_health_check` shows `on (N chars)` or `off`.
 
 ## Formatting cheatsheet
 
@@ -405,7 +464,8 @@ Set `format: "markdown"` to write ordinary Markdown instead (`**bold**`, `# head
 `[label](url)`, lists). The same string is sent as Slack's `markdown_text`, which holds
 at most **12,000 characters**. Mentions still need the `<@U…>` form. The other limits:
 `slack_post_message`, `slack_reply_in_thread` and `slack_schedule_message` accept up to
-40,000 characters of mrkdwn, and `slack_update_message` up to 4,000.
+40,000 characters of mrkdwn, and `slack_update_message` up to 4,000. A `SLACK_SIGNATURE`
+counts toward each of these limits.
 
 ## Running the tests
 
@@ -454,6 +514,12 @@ SLACK_TEST_ALLOW_WRITES=1 uv run pytest -m live_write   # the self-DM smoke (tes
   conversation always needs its id in `SLACK_WRITE_CHANNELS`.
 - **`msg_too_long` on an edit.** `chat.update` refuses more than 4,000 characters, so
   `slack_update_message` caps the text there. Shorten it, or post the rest as a reply.
+  With `SLACK_SIGNATURE` set, the signature counts too, and the error says how many
+  characters it adds.
+- **Teammates can't tell which messages the agent sent.** Slack adds no app label to a
+  message posted with a user token. Set `SLACK_SIGNATURE`
+  ([Signing your messages](#signing-your-messages)) and restart the client;
+  `slack_health_check` then shows `signature: on`.
 - **The health check says the token is rotating (`xoxe.xoxp-…`).** Token rotation was
   turned on, and Slack does not let you turn it off. The token expires every 12 hours, so
   create a new app with rotation off.

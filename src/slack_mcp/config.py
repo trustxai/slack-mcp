@@ -80,6 +80,13 @@ class Settings(BaseSettings):
     # member is listed here; `conversations.open` may only open conversations with them.
     slack_write_users: str = ""
 
+    # Optional last line for every message this server posts, replies, schedules or edits.
+    # Slack does not label messages sent with a user token — they look exactly like ones you
+    # typed — so this is how teammates can tell them apart. Empty = off. Written in Slack
+    # mrkdwn (`<url|label>` links are converted for `format="markdown"` posts). One line
+    # only: a multi-line value is collapsed to a single line (its lines joined by a space).
+    slack_signature: str = ""
+
     # MCP clients pass these via a JSON `env` block, where a pasted value often keeps a
     # trailing space/newline: the token then fails as a header value (and that error
     # echoes it back). Strip every string setting on the way in.
@@ -93,6 +100,16 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_whitespace(cls, value: object) -> object:
         return value.strip() if isinstance(value, str) else value
+
+    # The signature must stay ONE line: the chat tools recognise an already-signed text by
+    # its last line, and a pasted value often carries a stray newline. Stripped, like the
+    # other strings.
+    @field_validator("slack_signature", mode="before")
+    @classmethod
+    def _one_line(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        return " ".join(line.strip() for line in value.splitlines() if line.strip())
 
     @field_validator("slack_api_url", mode="after")
     @classmethod
@@ -139,6 +156,11 @@ class Settings(BaseSettings):
     def write_users(self) -> list[str]:
         """`SLACK_WRITE_USERS` as a de-duplicated list (order kept, blanks dropped)."""
         return self._split_csv(self.slack_write_users)
+
+    @property
+    def signature(self) -> str | None:
+        """`SLACK_SIGNATURE` (stripped, on one line), or `None` when it is not set."""
+        return self.slack_signature or None
 
     def token_problem(self) -> str | None:
         """`None` when the configured token is a usable user token; otherwise a message.
