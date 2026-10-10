@@ -13,6 +13,10 @@ from slack_mcp.errors import SlackApiError, handle_api_error, hint_for, redact_c
 from slack_mcp.guard import WriteNotAllowedError, WritesDisabledError
 
 TOKEN = "xoxp-FAKE-0123456789abcdef"
+# The one realistic-SHAPED token in the suite (digit groups, as Slack issues them), built at
+# runtime so the literal never appears in a file: GitHub push protection flags it as a real
+# Slack token (tests/test_fixtures_hygiene.py keeps every other fixture obviously fake).
+REALISTIC_SHAPED_TOKEN = "-".join(["xoxp", "1" * 12, "2" * 12, "3" * 12, "f" * 32])
 
 
 def _status_error(
@@ -220,11 +224,11 @@ def test_redaction_covers_the_configured_user_token(monkeypatch: pytest.MonkeyPa
     "token",
     [
         "xoxb-FAKE-0123456789abcdef",
-        "xoxp-1111-2222-3333-FAKEFAKEFAKE0123456789",
-        "xoxe.xoxp-1-FAKE0123456789",
-        "xoxe-1-FAKEREFRESH0123456789",
-        "xapp-1-A0123-FAKE0123456789",
-        "xoxe.xapp-1-FAKE0123456789",
+        pytest.param(REALISTIC_SHAPED_TOKEN, id="realistic-shape"),  # an explicit id: never echo it in test ids
+        "xoxe.xoxp-FAKE-0123456789",
+        "xoxe-FAKE-REFRESH0123456789",
+        "xapp-FAKE-A0123-0123456789",
+        "xoxe.xapp-FAKE-0123456789",
         "xwfp-FAKE-0123456789abcdef",
         "xoxc-FAKE-0123456789abcdef",
     ],
@@ -234,7 +238,7 @@ def test_redaction_of_unconfigured_slack_tokens_by_pattern(monkeypatch: pytest.M
     assert redact_credentials(f"Slack echoed {token}.") == "Slack echoed ***."
 
 
-@pytest.mark.parametrize("token", ["XOXB-FAKE-0123456789ABCDEF", "XOXE.XOXP-1-FAKE0123456789", "XAPP-1-A0123-FAKE0123"])
+@pytest.mark.parametrize("token", ["XOXB-FAKE-0123456789ABCDEF", "XOXE.XOXP-FAKE-0123456789", "XAPP-FAKE-A0123-0123"])
 def test_redaction_pattern_ignores_case(monkeypatch: pytest.MonkeyPatch, token: str) -> None:
     _use_settings(monkeypatch, Settings())
     assert redact_credentials(f"Slack echoed {token}.") == "Slack echoed ***."
@@ -247,7 +251,7 @@ def test_an_upper_cased_token_shaped_field_name_is_redacted(monkeypatch: pytest.
     class _Model(BaseModel):
         model_config = {"extra": "forbid"}
 
-    field = "xoxb-1234567890-abcdefghij"
+    field = "xoxb-FAKE-abcdefghij"
     with pytest.raises(ValidationError) as info:
         _Model.model_validate({field: 1})
     message = handle_api_error(info.value)

@@ -119,8 +119,9 @@ def compact_params(params: Mapping[str, Any] | None, *, form: bool) -> dict[str,
 
     Slack takes `users=U1,U2` / `types=public_channel,private_channel` as comma-joined
     strings in both encodings. In a form, bools become `true`/`false` and numbers become
-    strings; in JSON they stay native. Mappings and lists of mappings (blocks) stay
-    structured in JSON and are JSON-encoded strings in a form — no v0.1 tool sends them.
+    strings; in JSON they stay native. Mappings and lists of mappings stay structured in
+    JSON and are JSON-encoded strings in a form. The chat tools send Block Kit `blocks`
+    this way — as a list of mappings, on the JSON methods (`JSON_METHODS`).
     """
     out: dict[str, Any] = {}
     if not params:

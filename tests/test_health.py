@@ -207,7 +207,7 @@ async def test_health_warns_when_slack_reports_a_bot(monkeypatch: pytest.MonkeyP
 
 async def test_health_warns_about_a_rotating_token(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(routes={"auth.test": AUTH_TEST})
-    _patch(monkeypatch, fake, Settings(slack_user_token="xoxe.xoxp-1-FAKE-0123456789abcdef"))
+    _patch(monkeypatch, fake, Settings(slack_user_token="xoxe.xoxp-FAKE-0123456789abcdef"))
 
     result = await slack_health_check()
 
