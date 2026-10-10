@@ -14,7 +14,7 @@ from slack_mcp.config import (
 )
 
 USER_TOKEN = "xoxp-FAKE-0123456789abcdef"
-ROTATING_USER_TOKEN = "xoxe.xoxp-1-FAKE-0123456789abcdef"
+ROTATING_USER_TOKEN = "xoxe.xoxp-FAKE-0123456789abcdef"
 
 
 def test_defaults() -> None:
@@ -174,7 +174,7 @@ def test_the_refused_list_covers_bot_app_browser_and_rotating_kinds() -> None:
 
 
 def test_rotating_bot_token_is_named_precisely() -> None:
-    problem = Settings(slack_user_token="xoxe.xoxb-1-FAKE-0123456789abcdef").token_problem()
+    problem = Settings(slack_user_token="xoxe.xoxb-FAKE-0123456789abcdef").token_problem()
     assert problem is not None
     assert "a rotating bot token (xoxe.xoxb-…)" in problem
 

@@ -41,10 +41,10 @@ try:  # URL elicitation is newer than the declared mcp floor; its pass-through t
 except ImportError:  # pragma: no cover - exercised only against the floor version
     UrlElicitationRequiredError = None  # type: ignore[assignment,misc]
 
-FAKE_BOT = "xoxb-1234567890-abcdefghij"
-FAKE_USER = "xoxp-1234567890-abcdefghij"
+FAKE_BOT = "xoxb-FAKE-abcdefghij"
+FAKE_USER = "xoxp-FAKE-abcdefghij"
 # Longer than pydantic's 50-character repr limit, so `input_value=` shows head...tail.
-FAKE_LONG = "xoxp-1234567890-1234567890-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"
+FAKE_LONG = "xoxp-FAKE-0000000000-0000000000-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"
 CHANNEL = "C0123ABCDEF"
 
 
@@ -186,7 +186,7 @@ async def test_a_token_straddling_the_cut_is_redacted_before_clipping() -> None:
     start = MAX_ERROR_MESSAGE_CHARS - 12
     value = "a" * (start - len(prefix)) + FAKE_USER + " " + "y" * 100
     naive = redact_credentials(f"{prefix}{value}'"[:MAX_ERROR_MESSAGE_CHARS])
-    assert naive.endswith(FAKE_USER[:12]), naive  # the wrong order really would leak `xoxp-1234567`
+    assert naive.endswith(FAKE_USER[:12]), naive  # the wrong order really would leak `xoxp-FAKE-ab`
 
     text = await _sdk_error("slack_get_history", {"params": {"channel": value}})
 

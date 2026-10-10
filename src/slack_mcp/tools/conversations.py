@@ -978,7 +978,8 @@ async def slack_open_conversation(params: OpenConversationInput) -> str:
     AS YOU — the conversation is opened under your account, and a message you then post
     there goes out as you. Slack does not label these messages: they look exactly like
     ones you typed. To let teammates tell them apart, set `SLACK_SIGNATURE` — the server
-    appends it as the last line of every message it posts. Never retried automatically.
+    shows it under every message it posts, in a Block Kit context block. Never retried
+    automatically.
 
     When to Use:
     - To message someone (or a small group) privately: open first, then post to the id.
@@ -1040,7 +1041,7 @@ async def slack_open_conversation(params: OpenConversationInput) -> str:
             lines.append(f"- {warnings}")
         lines.append(
             f"- **next step**: post with slack_post_message(channel={cid!r}, …) — never to a U… id. That message goes "
-            "out as you, unlabeled by Slack (SLACK_SIGNATURE, if set, is appended as its last line)."
+            "out as you, unlabeled by Slack (SLACK_SIGNATURE, if set, is shown under it in a context block)."
         )
         return clip_response("\n".join(lines))
     except Exception as exc:

@@ -79,8 +79,8 @@ async def slack_health_check() -> str:
     writes are enabled (SLACK_ALLOW_WRITES), how many channel / user ids the
     allowlists contain, and whether a signature is configured: Slack does not label
     messages posted with a user token — they look exactly like ones you typed — so
-    `SLACK_SIGNATURE`, when set, is appended as the last line of every message the
-    chat tools post, reply, schedule or edit.
+    `SLACK_SIGNATURE`, when set, is shown under every message the chat tools post, reply,
+    schedule or edit (a Block Kit context block) and ends its plain-text fallback.
 
     When to Use:
     - As the first call after configuring the server, to confirm the token works.
