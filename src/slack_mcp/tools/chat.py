@@ -2,7 +2,7 @@
 
 Every tool here writes with the user token, so Slack shows the message under your own
 name and avatar. Slack does not label these messages: they look exactly like ones you
-typed (measured 2026-10-10 with an internal app, in a self-DM and in a public channel).
+typed (measured 2026-10-10 with an internal app, in a self-DM and in a channel).
 To let teammates tell them apart, set `SLACK_SIGNATURE` — `_sign` appends it as the last
 line of every message these tools post, reply, schedule or edit, never twice. The tools
 never gate, never retry and never pick an encoding: `client.call()` runs the write guard
@@ -20,6 +20,7 @@ combined with `text`. Every cap applies to the FINAL text, signature included.
 
 from __future__ import annotations
 
+import html
 import re
 import time
 from typing import Any, Literal, Self
@@ -119,22 +120,48 @@ def _signature_for(fmt: MessageFormat, signature: str) -> str:
 _SIGNATURE_SEPARATOR: dict[MessageFormat, str] = {"mrkdwn": "\n", "markdown": "\n\n"}
 
 
+def _comparable(line: str) -> str:
+    """A line as compared with the signature: entities decoded, edges trimmed.
+
+    Slack stores `&`, `<` and `>` of plain text as `&amp;` / `&lt;` / `&gt;`, so a signature
+    with an `&` (in its text or in a link's query string) reads back in its entity form.
+    """
+    return html.unescape(line).strip()
+
+
+def _is_signature_line(line: str, signature: str) -> bool:
+    """True when `line` is the signature in EITHER form — mrkdwn `<url|label>` or markdown `[label](url)`.
+
+    Either form counts whatever the current `format`, so switching format on an edit never
+    leaves two signature lines.
+    """
+    candidate = _comparable(line)
+    return candidate in {_comparable(signature), _comparable(_signature_for("markdown", signature))}
+
+
 def _sign(text: str, settings: Settings, fmt: MessageFormat = "mrkdwn") -> tuple[str, bool]:
     """`(text to send, appended?)` — the text plus the signature line, unless it already ends with it.
 
     Appends `"\\n" + signature` for mrkdwn and `"\\n\\n" + signature` (after a blank line)
-    for markdown. "Already ends with it" means the LAST line (whitespace-trimmed) equals the
-    signature as written for `fmt`, however many blank lines precede it: re-sending a
-    signed text (an edit of a signed message) keeps exactly one signature, while a
-    signature quoted in the middle of the text is signed again at the end. No signature
-    configured → the text unchanged.
+    for markdown. "Already ends with it" means the LAST line, trailing whitespace ignored,
+    is the signature in either form (`_is_signature_line`, entities decoded): that line is
+    then rewritten as the signature for `fmt`, behind that format's separator, so an edit
+    of a signed message — even from Slack's read-back text, or in the other format — keeps
+    exactly one signature, and in markdown it always stands after a blank line (never
+    inside the list item, quote or table row above it). A signature quoted in the middle of
+    the text does not count: the text is signed again at the end. No signature configured
+    → the text unchanged.
     """
     if settings.signature is None:
         return text, False
     signature = _signature_for(fmt, settings.signature)
-    if text.rsplit("\n", 1)[-1].strip() == signature:
-        return text, False
-    return f"{text}{_SIGNATURE_SEPARATOR[fmt]}{signature}", True
+    separator = _SIGNATURE_SEPARATOR[fmt]
+    body = text.rstrip()
+    head, _, last = body.rpartition("\n")
+    if _is_signature_line(last, settings.signature):
+        head = head.rstrip()
+        return (f"{head}{separator}{signature}" if head else signature), False
+    return f"{body}{separator}{signature}", True
 
 
 class SignedTextTooLongError(RuntimeError):
@@ -151,10 +178,13 @@ def _prepare_text(text: str, fmt: MessageFormat, limit: int, why: str) -> tuple[
     final, appended = _sign(text, settings, fmt)
     if len(final) > limit:
         signature = _signature_for(fmt, settings.signature or "")
-        included = f" including the {len(signature):,}-character signature (SLACK_SIGNATURE)" if appended else ""
+        # `final != text` also covers an existing signature line that was rewritten (its
+        # markdown blank line, or the other format's form), which can add characters.
+        included = f" including the {len(signature):,}-character signature (SLACK_SIGNATURE)" if final != text else ""
+        over = len(final) - limit
         raise SignedTextTooLongError(
             f"text is {len(final):,} characters{included}; the limit is {limit:,}{why} — shorten the text by at "
-            f"least {len(final) - limit:,} characters. Nothing was sent."
+            f"least {over:,} character{'' if over == 1 else 's'}. Nothing was sent."
         )
     if appended:
         line = "- **signature**: appended"
@@ -601,7 +631,9 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
     posted as you. Slack does not label these messages: they look exactly like ones you
     typed. To let teammates tell them apart, set `SLACK_SIGNATURE` — the server keeps it
     as the last line of the edited text: appended unless the new text already ends with
-    it, so an edit of a signed message stays signed exactly once. `format` works as in
+    it (in either format's form, or as Slack stored it, e.g. `&amp;`), so an edit of a
+    signed message — the text read back with `slack_get_thread` / `slack_get_history`,
+    changed — stays signed exactly once. `format` works as in
     `slack_post_message` (`mrkdwn` → `text`, `markdown` → `markdown_text`). The text
     (signature included) is capped at 4,000 characters locally because `chat.update`
     refuses longer text with `msg_too_long` (unlike `chat.postMessage`, which accepts up
@@ -681,8 +713,9 @@ async def slack_schedule_message(params: ScheduleMessageInput) -> str:
     message under your name and avatar. Slack does not label these messages: they look
     exactly like ones you typed. To let teammates tell them apart, set `SLACK_SIGNATURE` —
     the server appends it as the last line of every message it schedules (not again if the
-    text already ends with it; it counts toward the length limits). `post_at` is ISO-8601 (no offset = UTC) or epoch seconds, converted to epoch seconds;
-    it must be in the future and at most 120 days ahead (checked locally — Slack's limit).
+    text already ends with it; it counts toward the length limits). `post_at` is ISO-8601
+    (no offset = UTC) or epoch seconds, converted to epoch seconds; it must be in the
+    future and at most 120 days ahead (checked locally — Slack's limit).
     Slack also refuses more than 30 scheduled messages within any 5-minute window in the
     same channel (`restricted_too_many`). Text and `format` work as in `slack_post_message`.
     There is NO un-schedule tool in v0.1: once scheduled, this server cannot cancel or

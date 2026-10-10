@@ -7,7 +7,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for the
 your own internal Slack app, so everything it posts shows your name and avatar, and
 everything it reads is what you can see in Slack. Slack does not label these messages:
 they look exactly like ones you typed (measured with an internal app, in a self-DM and in
-a public channel). To let teammates tell them apart, set `SLACK_SIGNATURE` — the server
+a channel). To let teammates tell them apart, set `SLACK_SIGNATURE` — the server
 appends it as the last line of every message it posts, replies with or schedules, and
 keeps it on edits. See [Signing your messages](#signing-your-messages).
 
@@ -395,21 +395,23 @@ changing one. String values are whitespace-stripped. Real environment variables 
 ## Signing your messages
 
 Slack does not label these messages: they look exactly like ones you typed. Measured on
-2026-10-10 with an internal app and a user token, in a self-DM and in a public channel:
+2026-10-10 with an internal app and a user token, in a self-DM and in a channel:
 no app label under the message. To let teammates tell them apart, set `SLACK_SIGNATURE`
 — the server appends it as the last line of every message it posts. The closest match to
 an app label is a link to your app's page, which renders the `@Alejandro AI` part in link
 colour, like a tag:
 
 ```sh
-# .env (the App ID is on your app's Basic Information page)
-SLACK_SIGNATURE=Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>
+# .env — your workspace's subdomain, and the App ID from your app's Basic Information page
+SLACK_SIGNATURE=Sent using <https://<workspace>.slack.com/marketplace/<APP_ID>|@Alejandro AI>
 ```
 
-Use your own workspace and App ID. In a shell, quote the value (`<`, `>` and `|` are
-shell metacharacters); in a client's JSON `env` block it is an ordinary string. Slack's
-own small grey app label cannot be produced by a message, so this line is plain message
-text. How it behaves:
+For example, the author's app in the Masava workspace is
+`Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>`. In a
+shell, quote the value (`<`, `>` and `|` are shell metacharacters); in a client's JSON
+`env` block it is an ordinary string. Slack's own small grey app label cannot be
+produced by a message, so this line is plain message text — a marker, not provenance:
+anyone can type the same line by hand. How it behaves:
 
 - It is added as a new last line to `slack_post_message`, `slack_reply_in_thread` and
   `slack_schedule_message`, in both formats. Write it in mrkdwn. With the default
@@ -421,18 +423,21 @@ text. How it behaves:
 
   ```text
   format "mrkdwn":    Deploy done :rocket:
-                      Sent using <https://masavaco.slack.com/marketplace/A0C835DFNSH|@Alejandro AI>
+                      Sent using <https://<workspace>.slack.com/marketplace/<APP_ID>|@Alejandro AI>
 
   format "markdown":  - one
                       - two
 
-                      Sent using [@Alejandro AI](https://masavaco.slack.com/marketplace/A0C835DFNSH)
+                      Sent using [@Alejandro AI](https://<workspace>.slack.com/marketplace/<APP_ID>)
   ```
 
 - `slack_update_message` applies the same rule: the signature is appended unless the new
-  text already ends with it, so an edit of a signed message stays signed exactly once. A
-  signature quoted in the middle of a text does not count; the text is signed again at
-  the end.
+  text already ends with it, so an edit of a signed message stays signed exactly once.
+  The last line counts in either form (`<url|label>` or `[label](url)`, so switching
+  `format` on an edit is safe) and as Slack stores it (`&` read back as `&amp;`), so
+  editing the text read back from Slack does not add a second line. In markdown an
+  existing signature line is moved behind a blank line. A signature quoted in the middle
+  of a text does not count; the text is signed again at the end.
 - It counts toward Slack's length limits. A text that only goes over because of the
   signature is refused before anything is sent, and the error says so.
 - Every confirmation has a `signature` line (`appended`, `already the last line …`, or

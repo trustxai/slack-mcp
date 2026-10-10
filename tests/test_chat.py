@@ -811,9 +811,53 @@ def test_sign_re_signs_when_the_signature_is_not_the_last_line() -> None:
     assert _sign(middle, settings) == (f"{middle}\n{SIG}", True)
     same_line = f"Deploy done {SIG}"  # ends with it, but not as its own line
     assert _sign(same_line, settings) == (f"{same_line}\n{SIG}", True)
-    # The mrkdwn form is not the markdown signature line (it would render literally there).
-    assert _sign(f"x\n{SIG}", settings, "markdown") == (f"x\n{SIG}\n\n{SIG_MD}", True)
     assert _sign(f"x\n\n{SIG_MD}\n\nmore", settings, "markdown") == (f"x\n\n{SIG_MD}\n\nmore\n\n{SIG_MD}", True)
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+def test_either_signature_form_counts_whatever_the_format(fmt: Any) -> None:
+    """Switching format on an edit never leaves two lines: the old form is rewritten in place."""
+    settings = Settings(slack_signature=SIG)
+    for old_form in (SIG, SIG_MD):
+        for gap in ("\n", "\n\n"):
+            signed, appended = _sign(f"Deploy done{gap}{old_form}", settings, fmt)
+            assert (signed, appended) == (_signed("Deploy done", fmt), False), (old_form, gap)
+    assert _sign(SIG_MD, settings, "mrkdwn") == (SIG, False)  # the text IS the (other-form) signature
+    assert _sign(SIG, settings, "markdown") == (SIG_MD, False)
+
+
+AMP_SIG = "Sent by Ana & AI <https://x.example/app?b=1&c=2|@Alejandro AI>"
+AMP_SIG_READ_BACK = "Sent by Ana &amp; AI <https://x.example/app?b=1&amp;c=2|@Alejandro AI>"  # as Slack stores it
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+def test_a_signature_with_an_ampersand_matches_its_read_back_form(fmt: Any) -> None:
+    settings = Settings(slack_signature=AMP_SIG)
+    expected = _signature_for(fmt, AMP_SIG)
+    signed, appended = _sign(f"v2 of the report\n{AMP_SIG_READ_BACK}", settings, fmt)
+    assert appended is False  # recognised: not signed a second time
+    assert signed == f"v2 of the report{SEP[fmt]}{expected}"
+    assert signed.count("@Alejandro AI") == 1
+    # The entity-decoded comparison does not make a mid-text quote count.
+    assert _sign(f"{AMP_SIG_READ_BACK}\nmore", settings, fmt)[1] is True
+
+
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+def test_trailing_whitespace_after_the_signature_does_not_re_sign(fmt: Any) -> None:
+    settings = Settings(slack_signature=SIG)
+    for tail in ("\n", "\n\n", "  \n \t", "\r\n"):
+        signed, appended = _sign(f"x\n\n{SIGNATURES[fmt]}{tail}", settings, fmt)
+        assert (signed, appended) == (_signed("x", fmt), False), repr(tail)
+    assert _sign("x \n\n", settings, fmt) == (_signed("x", fmt), True)
+
+
+@pytest.mark.parametrize("block", ["## Plan\n- **one**\n- two", "> a quoted line", "| a | b |\n|---|---|\n| 1 | 2 |"])
+def test_markdown_moves_an_existing_signature_out_of_a_list_quote_or_table(block: str) -> None:
+    """A signature right under a block (single newline) would render inside it: it gets its blank line."""
+    settings = Settings(slack_signature=SIG)
+    assert _sign(f"{block}\n{SIG_MD}", settings, "markdown") == (f"{block}\n\n{SIG_MD}", False)
+    # mrkdwn has no such blocks: the single newline stays.
+    assert _sign(f"{block}\n{SIG}", settings) == (f"{block}\n{SIG}", False)
 
 
 def test_signature_links_are_converted_only_for_markdown() -> None:
@@ -931,6 +975,36 @@ async def test_update_of_a_signed_message_stays_signed_exactly_once(monkeypatch:
     assert result.count(SIGNATURES[fmt]) == 1  # only in Slack's stored text
 
 
+@pytest.mark.parametrize("fmt", ["mrkdwn", "markdown"])
+async def test_update_from_slacks_read_back_text_with_entities_does_not_double_sign(
+    monkeypatch: pytest.MonkeyPatch, fmt: Any
+) -> None:
+    """The edit flow: read the message back (Slack stores `&` as `&amp;`), change a word, update."""
+    _sign_with(monkeypatch, AMP_SIG)
+    fake = _FakeClient(routes={"chat.update": {"ok": True, "channel": CHANNEL, "ts": TS}})
+    _patch(monkeypatch, fake)
+    read_back = f"Deploy done &amp; verified\n{AMP_SIG_READ_BACK}"
+    edited = read_back.replace("verified", "re-verified")
+
+    result = await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text=edited, format=fmt))
+
+    sent = fake.calls[0][1][TEXT_KEY[fmt]]
+    assert sent == f"Deploy done &amp; re-verified{SEP[fmt]}{_signature_for(fmt, AMP_SIG)}"
+    assert sent.count("@Alejandro AI") == 1
+    assert "- **signature**: already the last line of the text — not added again" in result
+
+
+async def test_update_switching_format_keeps_one_signature_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    _sign_with(monkeypatch)
+    fake = _FakeClient(routes={"chat.update": {"ok": True, "channel": CHANNEL, "ts": TS}})
+    _patch(monkeypatch, fake)
+
+    # Posted as mrkdwn (mrkdwn-form signature), edited as markdown.
+    await slack_update_message(UpdateMessageInput(channel=CHANNEL, ts=TS, text=f"- a\n- b\n{SIG}", format="markdown"))
+
+    assert fake.calls[0][1] == {"channel": CHANNEL, "ts": TS, "markdown_text": f"- a\n- b\n\n{SIG_MD}"}
+
+
 async def test_every_confirmation_says_when_no_signature_is_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     when = int(time.time()) + 3_600
     fake = _FakeClient(
@@ -998,7 +1072,7 @@ async def test_post_reply_and_schedule_caps_count_the_signature(
 
     for result in results:
         assert result.startswith(_overflow_message(limit + 1, limit, signature)), result
-        assert "Nothing was sent." in result
+        assert "shorten the text by at least 1 character. Nothing was sent." in result  # singular
     assert fake.calls == []
 
 

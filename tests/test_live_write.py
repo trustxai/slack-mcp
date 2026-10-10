@@ -24,17 +24,21 @@ writes are on"; row 5's Slack Connect refusal must not fire for it). No channel 
 other person's id is ever used. Nothing is deleted — there is no delete tool — so the
 thread stays readable in the Slack client from the printed permalinks.
 
-O-3 is answered (measured 2026-10-10, internal app, user token, self-DM and a public
-channel): Slack shows NO native app label under these posts — they look exactly like ones
-you typed. `SLACK_SIGNATURE` is what tells them apart. When it is set for the run (shell or
-.env), step 9 asserts that the post (after its edit) and the thread reply, as read back by
-`slack_get_thread`, end with the signature line exactly once; unset, that check is skipped
-and the result block says so.
+O-3 is answered (measured 2026-10-10, internal app, user token, a self-DM and a channel):
+Slack shows NO native app label under these posts — they look exactly like ones you typed.
+`SLACK_SIGNATURE` is what tells them apart. Step 6 edits the post from its text AS SLACK
+STORED IT (read back with `slack_get_thread`, so a signed post comes back signed and
+entity-encoded), which is the edit flow that must not double-sign. When the signature is
+set for the run (shell or .env), step 9 asserts that the post (after that edit) and the
+thread reply end with the signature line, and that it appears exactly twice in the thread
+(once each); unset, that check is skipped and the result block says so.
 """
 
 from __future__ import annotations
 
 import asyncio
+import html
+import json
 import os
 import re
 import secrets
@@ -47,7 +51,7 @@ import pytest
 from slack_mcp.client import SlackClient, get_client, reset_client
 from slack_mcp.config import get_settings
 from slack_mcp.errors import SlackApiError
-from slack_mcp.formatters import MESSAGE_CONTINUATION
+from slack_mcp.formatters import MESSAGE_CONTINUATION, ResponseFormat
 from slack_mcp.tools.chat import (
     PostMessageInput,
     ReplyInThreadInput,
@@ -227,7 +231,16 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
     _RUN["permalink_reply"] = _field(replied, "permalink")
 
     # -- step 6: update the first post (keeps the mention, the link and the second line) --
-    edited_text = first_text.replace(f"smoke {nonce}:", f"smoke {nonce} {EDIT_MARKER}:", 1)
+    # Edit the text AS SLACK STORED IT, read back with slack_get_thread: with SLACK_SIGNATURE
+    # set it already ends with the signature (entity-encoded where Slack encodes `&`), and the
+    # edit must not sign it a second time.
+    stored = await slack_get_thread(
+        GetThreadInput(channel=dm, thread_ts=ts1, limit=5, response_format=ResponseFormat.JSON)
+    )
+    stored_items = json.loads(stored).get("items") or []
+    read_back = next((str(item.get("text") or "") for item in stored_items if item.get("ts") == ts1), "")
+    assert f"smoke {nonce}:" in read_back, f"step 6 read-back: the post's stored text was not found:\n{stored}"
+    edited_text = read_back.replace(f"smoke {nonce}:", f"smoke {nonce} {EDIT_MARKER}:", 1)
     updated = await slack_update_message(UpdateMessageInput(channel=dm, ts=ts1, text=edited_text))
     print("== slack_update_message ==\n" + updated)
     assert updated.startswith("# Message updated"), f"step 6 update: not confirmed:\n{updated}"
@@ -274,14 +287,18 @@ async def test_1_self_dm_write_scenario(live_stack: SlackClient) -> None:
     )
     # SLACK_SIGNATURE (O-3): when set, the post (as edited) and the reply must END with it, once.
     # render_message puts the `(ts …)` suffix on a message's last line, so "last line == the
-    # signature" reads as `  │ <signature> (ts <ts>)`.
+    # signature" reads as `  │ <signature> (ts <ts>)`. Compared entity-decoded: Slack stores
+    # an `&` of the signature as `&amp;`.
     if signature:
+        plain_thread, plain_signature = html.unescape(thread), html.unescape(signature)
         for label, ts in (("post, after its edit", ts1), ("thread reply", reply_ts)):
-            assert f"{MESSAGE_CONTINUATION}{signature} (ts {ts})" in thread, (
+            assert f"{MESSAGE_CONTINUATION}{plain_signature} (ts {ts})" in plain_thread, (
                 f"step 9 signature: the {label} ({ts}) does not end with SLACK_SIGNATURE {signature!r}:\n{thread}"
             )
-        doubled = f"{MESSAGE_CONTINUATION}{signature}\n{MESSAGE_CONTINUATION}{signature} (ts "
-        assert doubled not in thread, f"step 9 signature: a message ends with the signature TWICE:\n{thread}"
+        assert plain_thread.count(plain_signature) == 2, (
+            f"step 9 signature: expected it exactly twice (post + reply), found "
+            f"{plain_thread.count(plain_signature)} — the edit from the read-back text double-signed?\n{thread}"
+        )
         # The markdown post is not asserted — how Slack stores markdown_text is not measured
         # yet — only recorded, to compare by eye with its permalink.
         md_thread = await slack_get_thread(GetThreadInput(channel=dm, thread_ts=_RUN["md_ts"], limit=1))
