@@ -1,6 +1,6 @@
 [project]
 name = "amazing-slack-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for the Slack Web API that speaks as YOU (user token, stdio only, writes gated by allowlists)."
 readme = "README.md"
 license = "Apache-2.0"
