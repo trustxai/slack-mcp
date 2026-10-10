@@ -6,8 +6,10 @@ typed (measured 2026-10-10 with an internal app, in a self-DM and in a channel).
 To let teammates tell them apart, set `SLACK_SIGNATURE`. Every message these tools post,
 reply, schedule or edit then goes out as Block Kit `blocks` — the text, then the
 signature in a `context` block, the small grey font of Slack's own labels — plus a `text`
-fallback (for notifications, search and read-back) that ends with the signature after a
-blank line, never twice (`_sign`, `_build_message`). Without a signature the tools send
+fallback (for notifications and search) that ends with the signature after a blank line,
+never twice (`_sign`, `_build_message`). Slack stores that fallback with its newlines
+flattened to spaces, so the read tools rebuild such a message from its blocks
+(`formatters.render_message`). Without a signature the tools send
 plain `text` / `markdown_text`. The tools
 never gate, never retry and never pick an encoding: `client.call()` runs the write guard
 on the exact parameters that go on the wire (kill-switch, ID-only channel allowlist, DM
@@ -37,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from slack_mcp.client import SlackClient, get_client
 from slack_mcp.config import Settings, get_settings
 from slack_mcp.errors import SlackApiError, handle_api_error, hint_for
-from slack_mcp.formatters import clip_response, fmt_warnings, ts_to_human
+from slack_mcp.formatters import clip_response, fmt_warnings, mrkdwn_links_to_markdown, ts_to_human
 from slack_mcp.server import mcp
 from slack_mcp.validators import channel_id, iso_to_epoch, message_ts
 
@@ -104,25 +106,16 @@ def _text_field(fmt: MessageFormat, text: str) -> dict[str, str]:
 
 # -- the signature (SLACK_SIGNATURE) ---------------------------------------------
 
-# A mrkdwn link `<https://…|label>` (or mailto:). Mentions (`<@U…>`), channel links
-# (`<#C…|name>`) and specials (`<!here>`) do not match: they are not URLs.
-_MRKDWN_LINK = re.compile(r"<((?:https?|mailto):[^|<>\s]+)\|([^<>]+)>")
-
-
-def _markdown_label(label: str) -> str:
-    return label.replace("[", "\\[").replace("]", "\\]")
-
 
 def _signature_for(fmt: MessageFormat, signature: str) -> str:
     """The signature as it is written for `fmt`.
 
     `SLACK_SIGNATURE` is mrkdwn; `markdown_text` is standard Markdown, where `<url|label>`
     would render literally, so for `format="markdown"` each such link becomes
-    `[label](url)`. A bare `<url>` is already a Markdown autolink and stays as it is.
+    `[label](url)` (`formatters.mrkdwn_links_to_markdown`). A bare `<url>` is already a
+    Markdown autolink and stays as it is.
     """
-    if fmt != "markdown":
-        return signature
-    return _MRKDWN_LINK.sub(lambda m: f"[{_markdown_label(m.group(2))}]({m.group(1)})", signature)
+    return mrkdwn_links_to_markdown(signature) if fmt == "markdown" else signature
 
 
 # What goes between the text and the signature: a BLANK line, in both formats. In mrkdwn
@@ -132,42 +125,78 @@ def _signature_for(fmt: MessageFormat, signature: str) -> str:
 _SIGNATURE_SEPARATOR = "\n\n"
 
 
-def _comparable(line: str) -> str:
-    """A line as compared with the signature: entities decoded, edges trimmed.
+def _comparable(text: str) -> str:
+    """Text as compared with the signature: entities decoded, edges trimmed.
 
     Slack stores `&`, `<` and `>` of plain text as `&amp;` / `&lt;` / `&gt;`, so a signature
     with an `&` (in its text or in a link's query string) reads back in its entity form.
     """
-    return html.unescape(line).strip()
+    return html.unescape(text).strip()
 
 
-def _is_signature_line(line: str, signature: str) -> bool:
-    """True when `line` is the signature in EITHER form — mrkdwn `<url|label>` or markdown `[label](url)`.
+# The character-reference pattern `html.unescape` itself applies (CPython's `html._charref`),
+# so `_signature_start` splits a text exactly where `html.unescape` would decode it.
+_CHARREF = re.compile(r"&(#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[^\t\n\f <&#;]{1,32};?)")
 
-    Either form counts whatever the current `format`, so switching format on an edit never
-    leaves two signature lines.
+
+def _signature_start(body: str, form: str) -> int | None:
+    """The index in `body` where a trailing `form` begins, comparing entity-decoded; None if `body` does not end with it.
+
+    `form` is the signature as `_comparable` returns it. `body` (already right-trimmed) is
+    split into pieces — runs of plain text and whole character references — and walked
+    from the end: the decoded tail must equal `form` exactly, starting at a piece boundary
+    or anywhere inside a piece that decodes to itself, never in the middle of an entity
+    such as `&amp;`. What comes before the tail does not matter.
     """
-    candidate = _comparable(line)
-    return candidate in {_comparable(signature), _comparable(_signature_for("markdown", signature))}
+    pieces: list[tuple[int, str, str]] = []  # (index in body, raw, decoded)
+    pos = 0
+    for ref in _CHARREF.finditer(body):
+        if ref.start() > pos:
+            pieces.append((pos, body[pos : ref.start()], body[pos : ref.start()]))
+        pieces.append((ref.start(), ref.group(0), html.unescape(ref.group(0))))
+        pos = ref.end()
+    if pos < len(body):
+        pieces.append((pos, body[pos:], body[pos:]))
+    tail = ""
+    for start, raw, decoded in reversed(pieces):
+        missing = len(form) - len(tail)
+        if missing <= 0:
+            break
+        if raw == decoded and len(decoded) >= missing:
+            cut = len(decoded) - missing
+            return start + cut if decoded[cut:] + tail == form else None
+        tail = decoded + tail
+        if tail == form:
+            return start
+    return None
 
 
 def _unsigned(text: str, signature: str) -> tuple[str, bool]:
-    """`(text without its trailing signature lines, had one?)`.
+    """`(text without its trailing signature, had one?)`.
 
-    "Trailing signature line" means the LAST line, trailing whitespace ignored, is the
-    signature in either form (`_is_signature_line`, entities decoded); it is cut together
-    with the blank lines before it, and again while the new last line is one too — so a
-    text that somehow ends with the signature twice comes back with none. Otherwise the
-    text comes back right-trimmed. A signature quoted in the middle of the text is not a
-    trailing line and stays.
+    "Trailing signature" means the right-trimmed text ENDS with the signature in either
+    form — mrkdwn `<url|label>` or markdown `[label](url)`, whatever the current `format`,
+    so switching format on an edit never leaves two — compared with entities decoded
+    (`_signature_start`). Whatever separates it from the text does not matter: newlines,
+    spaces, tabs, or nothing at all. That is what makes an edit from Slack's read-back
+    safe: Slack stores the `text` fallback of a message posted with `blocks` with every
+    newline turned into a space (measured 2026-10-10: the blank line before the signature
+    read back as two spaces), so there the signature is no longer a line of its own. It
+    is cut, the text before it right-trimmed, and again while the text still ends with one
+    — so a text that ends with the signature twice comes back with none. Otherwise the
+    text comes back right-trimmed. A signature quoted in the middle of the text is not
+    trailing and stays. (A very short SLACK_SIGNATURE could match the last words of a
+    text that merely ends the same way; those words then move behind the blank line as
+    the signature — nothing is lost.)
     """
+    forms = {_comparable(signature), _comparable(_signature_for("markdown", signature))}
     body = text.rstrip()
     had_signature = False
     while body:
-        head, _, last = body.rpartition("\n")
-        if not _is_signature_line(last, signature):
+        starts = [start for form in forms if (start := _signature_start(body, form)) is not None]
+        if not starts:
             break
-        body, had_signature = head.rstrip(), True
+        body, had_signature = body[: min(starts)].rstrip(), True
     return body, had_signature
 
 
@@ -175,15 +204,16 @@ def _sign(text: str, settings: Settings, fmt: MessageFormat = "mrkdwn") -> tuple
     """`(text to send, appended?)` — the text plus the signature line, unless it already ends with it.
 
     Appends `"\\n\\n" + signature` — after a blank line — in both formats. "Already ends
-    with it" means the LAST line, trailing whitespace ignored, is the signature in either
-    form (`_unsigned`), whatever number of blank lines precedes it: that line is then
-    rewritten as the signature for `fmt`, behind exactly one blank line, so an edit of a
-    signed message — even from Slack's read-back text, or in the other format — keeps
-    exactly one signature, always standing apart from the text (and in markdown never
-    inside the list item, quote or table row above it). A signature quoted in the middle
-    of the text does not count: the text is signed again at the end. No signature
-    configured → the text unchanged. This is the `text` that goes on the wire (the
-    fallback, when `_build_message` adds the blocks).
+    with it" means the right-trimmed text ends with the signature in either form
+    (`_unsigned`), whatever separates it from the text — blank lines, one newline, the
+    spaces Slack's read-back leaves of them, or nothing: it is then rewritten as the
+    signature for `fmt`, behind exactly one blank line, so an edit of a signed message —
+    even from Slack's flattened read-back text, or in the other format — keeps exactly one
+    signature, always standing apart from the text (and in markdown never inside the list
+    item, quote or table row above it). A signature quoted in the middle of the text does
+    not count: the text is signed again at the end. No signature configured → the text
+    unchanged. This is the `text` that goes on the wire (the fallback, when
+    `_build_message` adds the blocks).
     """
     if settings.signature is None:
         return text, False
@@ -271,7 +301,7 @@ def _build_message(text: str, fmt: MessageFormat, settings: Settings) -> dict[st
     """The message fields of the wire params for the FINAL `text` (as `_sign` returned it).
 
     No signature configured → `{"text": …}` or `{"markdown_text": …}`, exactly as before.
-    With one → `{"text": text, "blocks": [...]}`: the text minus its trailing signature line
+    With one → `{"text": text, "blocks": [...]}`: the text minus its trailing signature
     (`_unsigned`, so the signature is never inside a body block) as one or more `section`
     blocks of mrkdwn (≤ 3,000 characters each, cut at line boundaries) — or, for
     `format="markdown"`, as ONE `markdown` block (≤ 12,000) with no `markdown_text`, which
@@ -339,7 +369,7 @@ def _prepare_message(text: str, fmt: MessageFormat, limit: int, why: str) -> tup
     if appended:
         line = "- **signature**: appended (context block)"
     elif settings.signature is not None:
-        line = "- **signature**: already the last line of the text — not added again (context block)"
+        line = "- **signature**: already at the end of the text — not added again (context block)"
     else:
         line = "- **signature**: not configured"
     return fields, line
@@ -798,14 +828,22 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
     posted as you. Slack does not label these messages: they look exactly like ones you
     typed. To let teammates tell them apart, set `SLACK_SIGNATURE` — the server keeps it
     as the last line of the edited text: appended unless the new text already ends with
-    it (in either format's form, or as Slack stored it, e.g. `&amp;`), so an edit of a
-    signed message — the text read back with `slack_get_thread` / `slack_get_history`,
-    changed — stays signed exactly once. With a signature the edit always resends the
-    `blocks` too (the text without its signature line, then the signature's `context`
-    block), replacing the old ones; Slack does not show its "edited" mark on an edit made
-    with blocks. `format` works as in `slack_post_message`: unsigned, `mrkdwn` → `text`
-    and `markdown` → `markdown_text`; signed, both send `text` + `blocks` (sections, or one
-    `markdown` block). The text
+    it (in either format's form, or as Slack stored it, e.g. `&amp;`, whatever separates
+    it from the text), so an edit of a signed message — the text read back with
+    `slack_get_thread` / `slack_get_history`, changed — stays signed exactly once. Slack
+    flattens the `text` fallback of a message posted with blocks (every newline stored as
+    a space); the read tools rebuild the text from the blocks, so for `format="mrkdwn"`
+    what you read back is what was posted — the signature on its own last line. One v0.1
+    limit: Slack stores a `markdown` block as `rich_text` (measured 2026-10-10), so a
+    message posted with `format: "markdown"` reads back from its flattened `text`, as one
+    line with only the signature on its own last line. Editing it from that read-back
+    loses its line structure (headings, lists and paragraphs run together). Pass the
+    original text when you edit such a message. With a signature the edit
+    always resends the `blocks` too (the text without its signature, then the signature's
+    `context` block), replacing the old ones; Slack does not show its "edited" mark on an
+    edit made with blocks. `format` works as in `slack_post_message`: unsigned, `mrkdwn` →
+    `text` and `markdown` → `markdown_text`; signed, both send `text` + `blocks`
+    (sections, or one `markdown` block). The text
     (signature included) is capped at 4,000 characters locally because `chat.update`
     refuses longer text with `msg_too_long` (unlike `chat.postMessage`, which accepts up
     to 40,000).
@@ -827,7 +865,7 @@ async def slack_update_message(params: UpdateMessageInput) -> str:
 
     Returns:
     A confirmation echoing only what Slack returned: `channel`, `ts`, the stored `text`,
-    and any Slack warning — plus a `signature` line (appended / already the last line /
+    and any Slack warning — plus a `signature` line (appended / already at the end /
     not configured) and, for an edit sent with blocks, a note that Slack hides its
     "edited" mark on it — or an `Error ...` string.
 

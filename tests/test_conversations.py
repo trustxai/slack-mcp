@@ -814,6 +814,62 @@ async def test_get_thread_json(monkeypatch: pytest.MonkeyPatch) -> None:
     assert data["has_more"] is False
 
 
+# t17 — measured live 2026-10-10: a message posted WITH blocks reads back with its `text`
+# flattened (newlines → spaces) and its blocks verbatim.
+_SIGNATURE = "*Sent using* <@U0C931FSW4Q>"
+_SIGNED_BLOCKS = [
+    {"type": "section", "text": {"type": "mrkdwn", "text": "Deploy done\nSecond line"}},
+    {"type": "context", "elements": [{"type": "mrkdwn", "text": _SIGNATURE}]},
+]
+_SIGNED_PARENT = _message(
+    PARENT_TS, f"Deploy done Second line  {_SIGNATURE}", user=ME, thread_ts=PARENT_TS, reply_count=1
+) | {"blocks": _SIGNED_BLOCKS}
+_SIGNED_REPLY = _message("1791548000.000200", f"Shipped  {_SIGNATURE}", user=ME, thread_ts=PARENT_TS) | {
+    "blocks": [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "Shipped"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": _SIGNATURE}]},
+    ]
+}
+_TYPED_REPLY = _message("1791549000.000300", "typed\nby hand", user=BOB, thread_ts=PARENT_TS) | {
+    "blocks": [{"type": "rich_text", "elements": []}]
+}
+
+
+async def test_get_thread_and_history_rebuild_block_messages_and_json_stays_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages = [_SIGNED_PARENT, _SIGNED_REPLY, _TYPED_REPLY]
+    fake = _FakeClient(
+        routes={
+            "conversations.replies": {"ok": True, "messages": messages, "response_metadata": {"next_cursor": ""}},
+            "conversations.history": {"ok": True, "messages": [_SIGNED_PARENT], "response_metadata": {}},
+        }
+    )
+    _patch(monkeypatch, fake)
+
+    thread = await slack_get_thread(GetThreadInput(channel=CHANNEL, thread_ts=PARENT_TS))
+    history = await slack_get_history(GetHistoryInput(channel=CHANNEL))
+    raw = json.loads(
+        await slack_get_thread(
+            GetThreadInput(channel=CHANNEL, thread_ts=PARENT_TS, response_format=ResponseFormat.JSON)
+        )
+    )
+
+    assert thread.splitlines()[-7:] == [
+        "[2026-10-09 12:00 UTC] U0SELF00001: Deploy done",
+        "  │ Second line",
+        f"  │ {_SIGNATURE} (ts {PARENT_TS}) · 1 reply",
+        "↳ [2026-10-09 12:13 UTC] U0SELF00001: Shipped",
+        f"  │ {_SIGNATURE} (ts 1791548000.000200)",
+        "↳ [2026-10-09 12:30 UTC] U0BOB000001: typed",  # rich_text only: Slack's own `text`
+        "  │ by hand (ts 1791549000.000300)",
+    ]
+    assert thread.count(_SIGNATURE) == 2  # once per signed message, never the flattened `text`'s copy
+    assert history.splitlines()[-3:] == thread.splitlines()[-7:-4]
+    assert raw["items"] == messages  # JSON mode: the raw objects, `blocks` and flattened `text` included
+    assert raw["items"][0]["blocks"] == _SIGNED_BLOCKS
+
+
 async def test_get_thread_thread_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(
         routes={"conversations.replies": SlackApiError("thread_not_found", method="conversations.replies")}
